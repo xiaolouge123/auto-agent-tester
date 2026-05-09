@@ -10,6 +10,7 @@ A Manifest V3 Chrome extension that lets an LLM inspect the active page, choose 
 - Executes one browser tool call per step: `click`, `type_text`, `select_option`, `press_key`, `scroll`, `wait`, or `finish`.
 - Shows a side-panel run log and a lightweight final summary.
 - Exports a full run transcript with page observations, prompts, LLM request bodies, raw responses, exposed reasoning fields when the provider returns them, parsed actions, and action results.
+- Runs batch tasks from a CSV or `.xlsx` file. By default it reads `id` and `prompt` columns, then exports one `<id>.zip` per row containing `metadata.json`, `result.json`, `log.txt`, and the recording when available.
 - Records the controlled tab while a run is active and exposes the recording as a `.webm` download after the run stops.
 - Shows an animated marquee border around the active page while the agent is running.
 - Keeps the Manifest V3 background service worker alive during Agent runs so slower LLM calls are less likely to disconnect the side panel.
@@ -30,6 +31,16 @@ A Manifest V3 Chrome extension that lets an LLM inspect the active page, choose 
 Click the extension icon to open the side panel, enter a testing or collection goal, then start a run on the active tab.
 
 After a run finishes, use **Download Recording** to save the captured tab video. Recording starts from the Start button click and stops on normal completion, max-step stop, error, manual Stop, or the `A` emergency shortcut. The extension first tries silent tab recording with `tabCapture`. If Chrome has not granted `activeTab` capture access for the current page, it falls back to Chrome's manual tab/window/screen picker; select the current test tab to continue recording. Chrome internal pages such as `chrome://extensions` cannot be captured or controlled by this Agent.
+
+For batch mode, upload a CSV or `.xlsx` file in the side panel. The file should include an ID column and a prompt column, for example:
+
+```csv
+id,prompt
+case-001,"Search for wireless keyboard and collect the first result title and price."
+case-002,"Open the cart and verify the empty cart message."
+```
+
+The batch runner executes rows sequentially against the current controlled tab. In batch mode, the side-panel `Goal` field is treated as a template when it contains placeholders such as `{{prompt}}`, `{{id}}`, or any other CSV/XLSX column name. If the `Goal` field has no placeholder, it is prepended to the row prompt as shared instructions. Each row downloads a zip named from the ID value; the zip contains an ID-named folder with the prompt metadata, full JSON transcript, run log, and `.webm` recording if capture was available.
 
 ## LLM action contract
 

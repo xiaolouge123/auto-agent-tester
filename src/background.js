@@ -5,6 +5,8 @@ const DEFAULT_SETTINGS = {
   allowedHosts: ""
 };
 
+const MAX_STEP_LIMIT = 100;
+
 const ACTION_TYPES = new Set([
   "click",
   "type",
@@ -88,7 +90,6 @@ chrome.runtime.onConnect.addListener((port) => {
             data: null,
             observations: state.observations || []
           });
-          post(port, { type: "error", message });
         })
         .finally(() => {
           stopRunKeepAlive();
@@ -119,7 +120,7 @@ function createRunState() {
 
 async function runAgent(port, state, payload) {
   const goal = String(payload?.goal || "").trim();
-  const maxStep = clampInteger(payload?.max_step ?? payload?.maxStep ?? payload?.maxSteps, 1, 30, 8);
+  const maxStep = clampInteger(payload?.max_step ?? payload?.maxStep ?? payload?.maxSteps, 1, MAX_STEP_LIMIT, 8);
 
   if (!goal) {
     throw new Error("Goal is required.");

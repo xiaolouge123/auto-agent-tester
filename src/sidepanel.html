@@ -18,13 +18,13 @@
 
       <section class="field">
         <label for="goal">Goal</label>
-        <textarea id="goal" rows="7" placeholder="Example: Search the product catalog for wireless keyboard, open the first result, and collect title, price, and availability."></textarea>
+        <textarea id="goal" rows="7" placeholder="Example: Search the product catalog for wireless keyboard, open the first result, and collect title, price, and availability. Batch template: {{prompt}}"></textarea>
       </section>
 
       <section class="run-bar">
         <label class="compact-field" for="maxStep">
           <span>Max Step</span>
-          <input id="maxStep" type="number" min="1" max="30" value="8">
+          <input id="maxStep" type="number" min="1" max="100" value="8">
         </label>
         <button id="startRun" class="primary">Start</button>
         <button id="stopRun" disabled>Stop</button>
@@ -33,6 +33,28 @@
       <section class="status-line">
         <span id="statusDot" class="dot idle"></span>
         <span id="statusText">Idle</span>
+      </section>
+
+      <section class="batch-panel">
+        <div class="batch-header">
+          <h2>Batch</h2>
+          <span id="batchStatus">No batch file</span>
+        </div>
+        <label class="file-field" for="batchFile">
+          <span>CSV or XLSX</span>
+          <input id="batchFile" type="file" accept=".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+        </label>
+        <div class="batch-grid">
+          <label class="compact-field" for="batchIdField">
+            <span>ID Field</span>
+            <input id="batchIdField" type="text" value="id">
+          </label>
+          <label class="compact-field" for="batchPromptField">
+            <span>Prompt Field</span>
+            <input id="batchPromptField" type="text" value="prompt">
+          </label>
+          <button id="startBatch" disabled>Start Batch</button>
+        </div>
       </section>
 
       <section class="output">

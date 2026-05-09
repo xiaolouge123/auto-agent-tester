@@ -176,6 +176,55 @@ input {
   background: var(--danger);
 }
 
+.batch-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 10px;
+}
+
+.batch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.batch-header span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: right;
+}
+
+.file-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.file-field input {
+  height: auto;
+  padding: 6px;
+  font-size: 12px;
+}
+
+.batch-grid {
+  display: grid;
+  grid-template-columns: minmax(70px, 1fr) minmax(90px, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.batch-grid button {
+  min-width: 92px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
 .output {
   display: flex;
   min-height: 0;
