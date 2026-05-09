@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Auto Agent Tester",
+  "version": "0.1.0",
+  "description": "LLM-driven browser testing agent for page understanding, clicks, text input, and data collection.",
+  "permissions": [
+    "activeTab",
+    "desktopCapture",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "tabCapture",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Auto Agent Tester"
+  },
+  "options_page": "src/options.html",
+  "side_panel": {
+    "default_path": "src/sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "src/contentScript.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
