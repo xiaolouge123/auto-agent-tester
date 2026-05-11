@@ -6,6 +6,7 @@ const DEFAULT_SETTINGS = {
 };
 
 const MAX_STEP_LIMIT = 100;
+const DEFAULT_MAX_STEP = 100;
 
 const ACTION_TYPES = new Set([
   "click",
@@ -23,10 +24,16 @@ const activeAgentRuns = new Map();
 let runKeepAliveCount = 0;
 let runKeepAliveInterval = null;
 
+initializeSidePanelBehavior();
+
 chrome.runtime.onInstalled.addListener(() => {
-  if (chrome.sidePanel?.setPanelBehavior) {
-    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
-  }
+  initializeSidePanelBehavior();
+});
+
+chrome.action.onClicked.addListener((tab) => {
+  openSidePanelFromAction(tab).catch((error) => {
+    console.warn("Could not open side panel from action click", error);
+  });
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
@@ -105,6 +112,34 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 });
 
+async function initializeSidePanelBehavior() {
+  if (!chrome.sidePanel?.setPanelBehavior) return;
+
+  try {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  } catch (error) {
+    console.warn("Could not configure side panel action behavior", error);
+  }
+}
+
+async function openSidePanelFromAction(tab) {
+  await initializeSidePanelBehavior();
+  if (!chrome.sidePanel?.open) {
+    console.warn("chrome.sidePanel.open is unavailable. Use Chrome 116 or newer.");
+    return;
+  }
+
+  if (tab?.windowId != null) {
+    await chrome.sidePanel.open({ windowId: tab.windowId });
+    return;
+  }
+
+  const currentWindow = await chrome.windows.getCurrent();
+  if (currentWindow?.id != null) {
+    await chrome.sidePanel.open({ windowId: currentWindow.id });
+  }
+}
+
 function createRunState() {
   return {
     abortController: null,
@@ -120,7 +155,7 @@ function createRunState() {
 
 async function runAgent(port, state, payload) {
   const goal = String(payload?.goal || "").trim();
-  const maxStep = clampInteger(payload?.max_step ?? payload?.maxStep ?? payload?.maxSteps, 1, MAX_STEP_LIMIT, 8);
+  const maxStep = clampInteger(payload?.max_step ?? payload?.maxStep ?? payload?.maxSteps, 1, MAX_STEP_LIMIT, DEFAULT_MAX_STEP);
 
   if (!goal) {
     throw new Error("Goal is required.");

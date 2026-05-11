@@ -28,6 +28,7 @@ const RECORDING_MIME_TYPES = [
 
 const DEFAULT_ID_FIELD = "id";
 const DEFAULT_PROMPT_FIELD = "prompt";
+const DEFAULT_MAX_STEP = 100;
 const ZIP_UTF8_FLAG = 0x0800;
 
 let port = null;
@@ -57,7 +58,7 @@ restoreDraft();
 
 elements.startRun.addEventListener("click", async () => {
   const goal = elements.goal.value.trim();
-  const maxStep = Number.parseInt(elements.maxStep.value, 10) || 8;
+  const maxStep = Number.parseInt(elements.maxStep.value, 10) || DEFAULT_MAX_STEP;
   if (!goal) {
     addLog("error", "Goal is required.");
     return;
@@ -372,9 +373,9 @@ function resolveCurrentRun(payload) {
 }
 
 async function restoreDraft() {
-  const data = await chrome.storage.local.get({ lastGoal: "", lastMaxStep: 0, lastMaxSteps: 8 });
+  const data = await chrome.storage.local.get({ lastGoal: "", lastMaxStep: 0, lastMaxSteps: DEFAULT_MAX_STEP });
   elements.goal.value = data.lastGoal || "";
-  elements.maxStep.value = data.lastMaxStep || data.lastMaxSteps || 8;
+  elements.maxStep.value = data.lastMaxStep || data.lastMaxSteps || DEFAULT_MAX_STEP;
 }
 
 function setRunning(isRunning) {
@@ -464,7 +465,7 @@ async function runBatch() {
     return;
   }
 
-  const maxStep = Number.parseInt(elements.maxStep.value, 10) || 8;
+  const maxStep = Number.parseInt(elements.maxStep.value, 10) || DEFAULT_MAX_STEP;
   const goalTemplate = elements.goal.value.trim();
   setBatchRunning(true);
   batchAbortRequested = false;
