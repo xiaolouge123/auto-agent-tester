@@ -10,8 +10,14 @@ const DEFAULT_MAX_STEP = 100;
 
 const ACTION_TYPES = new Set([
   "click",
+  "double_click",
+  "hover",
+  "focus",
   "type",
+  "clear",
   "select",
+  "set_checked",
+  "drag",
   "press_key",
   "scroll",
   "wait",
@@ -276,6 +282,18 @@ async function runAgent(port, state, payload) {
 
       const toolCall = (assistantMessage.tool_calls || [])[0];
       if (!toolCall) {
+        stepRecord.endedAt = new Date().toISOString();
+        const finalPageSnapshot = await getPageArchiveSnapshot(tab.id);
+        await postCheckpoint(port, {
+          step,
+          snapshot: currentSnapshot,
+          pageSnapshot: finalPageSnapshot,
+          windowId: tab.windowId,
+          eventType: "final_result_stable",
+          trigger: {
+            type: "model_no_tool_call"
+          }
+        });
         postFinal(port, state, {
           status: "done",
           summary: getAssistantContent(assistantMessage) || "Model returned without a tool call.",
@@ -298,6 +316,19 @@ async function runAgent(port, state, payload) {
       };
 
       if (toolDecision.final) {
+        stepRecord.endedAt = new Date().toISOString();
+        const finalPageSnapshot = await getPageArchiveSnapshot(tab.id);
+        await postCheckpoint(port, {
+          step,
+          snapshot: currentSnapshot,
+          pageSnapshot: finalPageSnapshot,
+          windowId: tab.windowId,
+          eventType: "final_result_stable",
+          trigger: {
+            type: "finish",
+            final: toolDecision.final
+          }
+        });
         const toolResult = {
           ok: true,
           status: toolDecision.final.status,
@@ -355,6 +386,17 @@ async function runAgent(port, state, payload) {
 
       await delay(getPostActionDelay(action.type));
       currentSnapshot = await getSnapshot(tab.id);
+      await postCheckpoint(port, {
+        step,
+        snapshot: currentSnapshot,
+        windowId: tab.windowId,
+        eventType: checkpointEventTypeForAction(action),
+        trigger: {
+          type: "tester_action",
+          action: compactAction(action),
+          result
+        }
+      });
       const toolResult = buildToolResult(step, action, result, currentSnapshot);
       stepRecord.toolResults = [{ toolCall, result: toolResult }];
       messages.push(toolResultMessage(toolCall, toolResult));
@@ -404,6 +446,7 @@ function createTranscript({ goal, maxStep, settings, tab }) {
     max_step: maxStep,
     tab: {
       id: tab.id,
+      windowId: tab.windowId ?? null,
       title: tab.title || "",
       url: tab.url || ""
     },
@@ -425,6 +468,7 @@ function snapshotForTranscript(snapshot) {
     url: snapshot.url,
     viewport: snapshot.viewport,
     scroll: snapshot.scroll,
+    observationScope: snapshot.observationScope || {},
     focusedElementId: snapshot.focusedElementId || "",
     actionTargetCount: snapshot.elements?.length || 0,
     observationText: snapshot.observationText || snapshot.text || "",
@@ -594,6 +638,113 @@ async function getSnapshot(tabId) {
   }
 }
 
+async function getPageArchiveSnapshot(tabId) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_ARCHIVE_SNAPSHOT" });
+  } catch (error) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["src/contentScript.js"]
+      });
+      await delay(150);
+      return await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_ARCHIVE_SNAPSHOT" });
+    } catch (nestedError) {
+      console.warn("Could not capture final page snapshot", nestedError);
+      return {
+        schema_version: "page-snapshot.v1",
+        capture_type: "final_page_snapshot",
+        captured_at: new Date().toISOString(),
+        error: getErrorMessage(nestedError),
+        url: "",
+        title: "",
+        html: "",
+        resources: []
+      };
+    }
+  }
+}
+
+async function captureVisibleTabDataUrl(windowId) {
+  if (!chrome.tabs.captureVisibleTab) {
+    return { dataUrl: null, error: "chrome.tabs.captureVisibleTab is unavailable." };
+  }
+
+  let lastError = "";
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) {
+      await delay(250 + attempt * 250);
+    }
+
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        chrome.tabs.captureVisibleTab(windowId ?? undefined, { format: "png" }, (value) => {
+          const error = chrome.runtime.lastError;
+          if (error) {
+            reject(new Error(error.message || "Capture failed."));
+            return;
+          }
+          resolve(typeof value === "string" && value ? value : null);
+        });
+      });
+      if (dataUrl) {
+        return { dataUrl, error: "" };
+      }
+      lastError = "Capture returned empty image data.";
+    } catch (error) {
+      lastError = getErrorMessage(error);
+      console.warn("Could not capture checkpoint screenshot", error);
+    }
+  }
+
+  return { dataUrl: null, error: lastError || "Capture failed." };
+}
+
+async function postCheckpoint(port, options) {
+  const capturedAt = new Date().toISOString();
+  const screenshotCapture = await captureVisibleTabDataUrl(options.windowId);
+  const screenshotDataUrl = screenshotCapture.dataUrl;
+  const snapshot = options.snapshot || {};
+  post(port, {
+    type: "checkpoint",
+    step: options.step,
+    eventType: options.eventType || "website_state_stable",
+    stability: options.stability || "stable",
+    createdAt: capturedAt,
+    page: snapshotForTranscript(snapshot),
+    pageSnapshot: options.pageSnapshot || null,
+    trigger: options.trigger || {},
+    screenshotError: screenshotCapture.error || "",
+    screenshot: screenshotDataUrl
+      ? {
+          dataUrl: screenshotDataUrl,
+          mimeType: "image/png",
+          width: snapshot.viewport?.width || 0,
+          height: snapshot.viewport?.height || 0,
+          capturedAt
+        }
+      : null
+  });
+}
+
+function checkpointEventTypeForAction(action) {
+  switch (action?.type) {
+    case "scroll":
+      return "viewport_state_stable";
+    case "wait":
+      return "assistant_output_stable";
+    case "click":
+    case "type_text":
+    case "select_option":
+    case "press_key":
+    case "hover":
+    case "drag":
+      return "website_state_stable";
+    default:
+      return "website_state_stable";
+  }
+}
+
 async function executeAction(tabId, action) {
   return chrome.tabs.sendMessage(tabId, {
     type: "EXECUTE_ACTION",
@@ -631,9 +782,10 @@ function buildMessages(goal, step, snapshot, observations) {
     "You inspect compact accessibility-tree-like page observations and choose exactly one next browser tool call.",
     "Do not output JSON actions in assistant content. Use the provided tools for every browser action and use finish when the task is complete or impossible.",
     "Actionable page nodes are shown as [elementId] role \"name\". Use the elementId without brackets, for example e12.",
-    "The page observation is partial and viewport-centered unless it explicitly says the page is at both top and bottom.",
+    "The page observation says whether it is a full-page DOM view or an expanded viewport-centered DOM view. Use scroll when content is omitted.",
     "Indentation is meaningful: child lines belong to the nearest less-indented parent group, form, region, list item, or component.",
     "Prefer elementId over selector when targeting elements. Use scroll when the needed content is likely offscreen or omitted.",
+    "Use focus before keyboard-only interactions, hover for menus that reveal on mouseover, targeted scroll for nested scrollable panes, and drag for sliders or draggable controls.",
     "Use done when the requested test/data collection goal is complete.",
     "Tool results include the updated page observation for the next step.",
     "Do not complete purchases, submit payments, bypass CAPTCHAs, or perform irreversible production actions unless the goal explicitly says this is a test environment and the page clearly confirms it."
@@ -670,7 +822,7 @@ function createBrowserTools() {
   const targetProperties = {
     elementId: {
       type: "string",
-      description: "Actionable element id from the observation, such as e12."
+      description: "Actionable or scrollable element id from the observation, such as e12."
     },
     selector: {
       type: "string",
@@ -684,6 +836,42 @@ function createBrowserTools() {
       function: {
         name: "click",
         description: "Click an actionable page element.",
+        parameters: {
+          type: "object",
+          properties: targetProperties,
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "double_click",
+        description: "Double-click an actionable page element.",
+        parameters: {
+          type: "object",
+          properties: targetProperties,
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "hover",
+        description: "Move the pointer over an element to reveal hover menus or tooltips.",
+        parameters: {
+          type: "object",
+          properties: targetProperties,
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "focus",
+        description: "Focus an element without clicking it.",
         parameters: {
           type: "object",
           properties: targetProperties,
@@ -711,6 +899,18 @@ function createBrowserTools() {
     {
       type: "function",
       function: {
+        name: "clear_text",
+        description: "Clear text from an input, textarea, select, or contenteditable element.",
+        parameters: {
+          type: "object",
+          properties: targetProperties,
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
         name: "select_option",
         description: "Select an option in a select element by value.",
         parameters: {
@@ -727,12 +927,33 @@ function createBrowserTools() {
     {
       type: "function",
       function: {
-        name: "press_key",
-        description: "Press a keyboard key on the currently focused element.",
+        name: "set_checked",
+        description: "Set a checkbox, radio button, or switch to a desired checked state.",
         parameters: {
           type: "object",
           properties: {
-            key: { type: "string", description: "Keyboard key, such as Enter, Escape, ArrowDown, Tab." }
+            ...targetProperties,
+            checked: { type: "boolean", description: "Desired checked state." }
+          },
+          required: ["checked"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "press_key",
+        description: "Press a keyboard key on the currently focused element or an explicitly targeted element.",
+        parameters: {
+          type: "object",
+          properties: {
+            ...targetProperties,
+            key: { type: "string", description: "Keyboard key, such as Enter, Escape, ArrowDown, Tab." },
+            shift: { type: "boolean", description: "Hold Shift while pressing the key." },
+            ctrl: { type: "boolean", description: "Hold Control while pressing the key." },
+            alt: { type: "boolean", description: "Hold Alt/Option while pressing the key." },
+            meta: { type: "boolean", description: "Hold Command/Windows while pressing the key." }
           },
           required: ["key"],
           additionalProperties: false
@@ -742,12 +963,31 @@ function createBrowserTools() {
     {
       type: "function",
       function: {
-        name: "scroll",
-        description: "Scroll the current page to inspect omitted content.",
+        name: "drag",
+        description: "Drag an element by a viewport pixel delta, useful for sliders and draggable controls.",
         parameters: {
           type: "object",
           properties: {
-            direction: { type: "string", enum: ["down", "up"] },
+            ...targetProperties,
+            deltaX: { type: "integer", minimum: -5000, maximum: 5000 },
+            deltaY: { type: "integer", minimum: -5000, maximum: 5000 },
+            steps: { type: "integer", minimum: 1, maximum: 30 }
+          },
+          required: ["deltaX", "deltaY"],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "scroll",
+        description: "Scroll the page or a targeted scrollable element to inspect omitted content.",
+        parameters: {
+          type: "object",
+          properties: {
+            ...targetProperties,
+            direction: { type: "string", enum: ["down", "up", "left", "right"] },
             amount: { type: "integer", minimum: 1, maximum: 5000 }
           },
           required: ["direction"],
@@ -976,23 +1216,48 @@ function toolCallToDecision(toolCall) {
 
   const map = {
     click: () => ({ type: "click", ...baseTarget }),
+    double_click: () => ({ type: "double_click", ...baseTarget }),
+    hover: () => ({ type: "hover", ...baseTarget }),
+    focus: () => ({ type: "focus", ...baseTarget }),
     type_text: () => ({
       type: "type",
       ...baseTarget,
       text: String(args.text ?? ""),
       clear: Boolean(args.clear)
     }),
+    clear_text: () => ({
+      type: "clear",
+      ...baseTarget
+    }),
     select_option: () => ({
       type: "select",
       ...baseTarget,
       value: String(args.value ?? "")
     }),
+    set_checked: () => ({
+      type: "set_checked",
+      ...baseTarget,
+      checked: Boolean(args.checked)
+    }),
     press_key: () => ({
       type: "press_key",
+      ...baseTarget,
+      shift: Boolean(args.shift),
+      ctrl: Boolean(args.ctrl),
+      alt: Boolean(args.alt),
+      meta: Boolean(args.meta),
       key: String(args.key || "Enter")
+    }),
+    drag: () => ({
+      type: "drag",
+      ...baseTarget,
+      deltaX: args.deltaX,
+      deltaY: args.deltaY,
+      steps: args.steps
     }),
     scroll: () => ({
       type: "scroll",
+      ...baseTarget,
       direction: String(args.direction || "down"),
       amount: args.amount
     }),
@@ -1031,6 +1296,7 @@ function buildToolResult(step, action, result, snapshot) {
       url: snapshot.url,
       viewport: snapshot.viewport,
       scroll: snapshot.scroll,
+      observationScope: snapshot.observationScope || {},
       focusedElementId: snapshot.focusedElementId || "",
       actionTargetCount: snapshot.elements?.length || 0,
       observationText: snapshot.observationText || snapshot.text || ""
@@ -1094,6 +1360,14 @@ function normalizeAction(rawAction) {
   if (action.amount != null) action.amount = clampInteger(action.amount, 1, 5000, 700);
   if (action.ms != null) action.ms = clampInteger(action.ms, 0, 10000, 1000);
   if (action.clear != null) action.clear = Boolean(action.clear);
+  if (action.checked != null) action.checked = Boolean(action.checked);
+  if (action.shift != null) action.shift = Boolean(action.shift);
+  if (action.ctrl != null) action.ctrl = Boolean(action.ctrl);
+  if (action.alt != null) action.alt = Boolean(action.alt);
+  if (action.meta != null) action.meta = Boolean(action.meta);
+  if (action.deltaX != null) action.deltaX = clampInteger(action.deltaX, -5000, 5000, 0);
+  if (action.deltaY != null) action.deltaY = clampInteger(action.deltaY, -5000, 5000, 0);
+  if (action.steps != null) action.steps = clampInteger(action.steps, 1, 30, 10);
   return action;
 }
 
@@ -1123,9 +1397,10 @@ function delay(ms) {
 
 function getPostActionDelay(actionType) {
   if (actionType === "wait") return 0;
-  if (actionType === "click") return 1200;
+  if (actionType === "click" || actionType === "double_click") return 1200;
   if (actionType === "press_key") return 900;
   if (actionType === "scroll") return 350;
+  if (actionType === "hover" || actionType === "focus" || actionType === "drag") return 500;
   return 500;
 }
 

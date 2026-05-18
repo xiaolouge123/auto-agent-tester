@@ -1,13 +1,14 @@
 # Auto Agent Tester
 
-A Manifest V3 Chrome extension that lets an LLM inspect the active page, choose browser actions, execute clicks/text input/scrolling, and return structured test or collection results.
+A Manifest V3 Chrome extension that lets an LLM inspect the active page, choose browser actions, execute clicks, text input, hover/focus/key/drag/scroll interactions, and return structured test or collection results.
 
 ## What it does
 
 - Captures a compact BrowserGym-inspired page observation: URL, title, viewport state, a hierarchical accessibility-tree-like text view, and actionable element IDs.
-- Marks the observation as partial when content above or below the viewport is omitted, so the model knows when to scroll.
+- Captures a full-page DOM observation for short pages, and an expanded viewport-centered observation for longer pages.
+- Marks the observation as partial when content above or below the expanded scope is omitted, so the model knows when to scroll.
 - Sends that snapshot plus your goal to an OpenAI-compatible `/chat/completions` LLM endpoint with browser actions exposed as tool calls.
-- Executes one browser tool call per step: `click`, `type_text`, `select_option`, `press_key`, `scroll`, `wait`, or `finish`.
+- Executes one browser tool call per step: `click`, `double_click`, `hover`, `focus`, `type_text`, `clear_text`, `select_option`, `set_checked`, `press_key`, `drag`, `scroll`, `wait`, or `finish`.
 - Shows a side-panel run log and a lightweight final summary.
 - Exports a full run transcript with page observations, prompts, LLM request bodies, raw responses, exposed reasoning fields when the provider returns them, parsed actions, and action results.
 - Runs batch tasks from a CSV or `.xlsx` file. By default it reads `id` and `prompt` columns, then exports one `<id>.zip` per row containing `metadata.json`, `result.json`, `log.txt`, and the recording when available.
@@ -59,6 +60,15 @@ The background service worker asks the model to call one browser tool per step. 
   ]
 }
 ```
+
+Available browser tools:
+
+- `click`, `double_click`, `hover`, and `focus` target an observed `elementId` or a fallback CSS `selector`.
+- `type_text` enters text and can clear first with `clear`; `clear_text` clears a text input, textarea, select, or contenteditable element.
+- `select_option` selects a native `<select>` option by value; `set_checked` sets checkbox/radio/switch state deterministically.
+- `press_key` can target an element before pressing a key and supports `shift`, `ctrl`, `alt`, and `meta` modifiers.
+- `drag` drags a target by `deltaX`/`deltaY` viewport pixels; range inputs are adjusted directly from the delta.
+- `scroll` can scroll the page or a targeted scrollable element, including `up`, `down`, `left`, and `right`.
 
 Completion uses the `finish` tool:
 

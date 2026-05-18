@@ -8,10 +8,16 @@
   let activityStyle;
 
   const MAX_ACTION_TARGETS = 220;
-  const OBSERVATION_MAX_CHARS = 14000;
-  const OBSERVATION_MAX_LINES = 260;
-  const NEAR_VIEWPORT_MARGIN_TOP = 800;
-  const NEAR_VIEWPORT_MARGIN_BOTTOM = 1800;
+  const OBSERVATION_PARTIAL_MAX_CHARS = 20000;
+  const OBSERVATION_PARTIAL_MAX_LINES = 360;
+  const OBSERVATION_FULL_MAX_CHARS = 30000;
+  const OBSERVATION_FULL_MAX_LINES = 520;
+  const FULL_PAGE_OBSERVATION_MAX_HEIGHT = 7000;
+  const FULL_PAGE_OBSERVATION_MAX_DOM_ELEMENTS = 1800;
+  const EXPANDED_VIEWPORT_PAGES_ABOVE = 1.5;
+  const EXPANDED_VIEWPORT_PAGES_BELOW = 3;
+  const MIN_OBSERVATION_MARGIN_TOP = 1200;
+  const MIN_OBSERVATION_MARGIN_BOTTOM = 2400;
   const TREE_EXCLUDED_TAGS = new Set([
     "script",
     "style",
@@ -54,6 +60,11 @@
       return false;
     }
 
+    if (message?.type === "GET_PAGE_ARCHIVE_SNAPSHOT") {
+      sendResponse(createPageArchiveSnapshot());
+      return false;
+    }
+
     if (message?.type === "EXECUTE_ACTION") {
       executeAction(message.action)
         .then((result) => sendResponse(result))
@@ -76,7 +87,8 @@
   function createSnapshot() {
     elementCache.clear();
 
-    const targetEntries = collectInteractiveElements()
+    const scope = getSnapshotScope();
+    const targetEntries = collectInteractiveElements(scope)
       .slice(0, MAX_ACTION_TARGETS)
       .map((element, index) => {
         const description = describeElement(element, `e${index + 1}`);
@@ -85,7 +97,7 @@
       .filter(Boolean);
     const targetMap = new Map(targetEntries.map(({ element, description }) => [element, description]));
     const elements = targetEntries.map(({ description }) => description);
-    const observationText = buildPageObservation(targetMap, elements);
+    const observationText = buildPageObservation(targetMap, elements, scope);
 
     return {
       title: document.title,
@@ -97,7 +109,16 @@
       scroll: {
         x: Math.round(window.scrollX),
         y: Math.round(window.scrollY),
-        maxY: Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+        maxY: scope.maxScrollY
+      },
+      observationScope: {
+        mode: scope.mode,
+        documentHeight: scope.documentHeight,
+        documentElementCount: scope.documentElementCount,
+        marginTop: scope.marginTop,
+        marginBottom: scope.marginBottom,
+        maxChars: scope.maxChars,
+        maxLines: scope.maxLines
       },
       text: observationText,
       observationText,
@@ -106,7 +127,273 @@
     };
   }
 
-  function collectInteractiveElements() {
+  function createPageArchiveSnapshot() {
+    const capturedAt = new Date().toISOString();
+    const resources = collectPageSnapshotResources();
+
+    return {
+      schema_version: "page-snapshot.v1",
+      capture_type: "final_page_snapshot",
+      captured_at: capturedAt,
+      url: location.href,
+      title: document.title,
+      base_uri: document.baseURI,
+      html: serializeCurrentDocument(),
+      text: truncateText(document.body?.innerText || "", 50000),
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight
+      },
+      scroll: {
+        x: Math.round(window.scrollX),
+        y: Math.round(window.scrollY),
+        max_y: getSnapshotScope().maxScrollY
+      },
+      document: {
+        content_type: document.contentType || "text/html",
+        character_set: document.characterSet || "",
+        compat_mode: document.compatMode || "",
+        ready_state: document.readyState || "",
+        referrer: document.referrer || ""
+      },
+      resources
+    };
+  }
+
+  function serializeCurrentDocument() {
+    const doctype = document.doctype ? serializeDoctype(document.doctype) : "<!doctype html>";
+    return `${doctype}\n${document.documentElement.outerHTML}`;
+  }
+
+  function serializeDoctype(doctype) {
+    const publicId = doctype.publicId ? ` PUBLIC "${doctype.publicId}"` : "";
+    const systemId = doctype.systemId
+      ? (publicId ? ` "${doctype.systemId}"` : ` SYSTEM "${doctype.systemId}"`)
+      : "";
+    return `<!doctype ${doctype.name}${publicId}${systemId}>`;
+  }
+
+  function collectPageSnapshotResources() {
+    const entries = [];
+    const seen = new Set();
+
+    const addResource = (rawUrl, meta = {}) => {
+      const absoluteUrl = toAbsoluteUrl(rawUrl);
+      if (!absoluteUrl) return;
+      const key = `${meta.tag || ""}:${meta.attr || ""}:${absoluteUrl}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      entries.push({
+        id: `res_${String(entries.length + 1).padStart(4, "0")}`,
+        url: absoluteUrl,
+        original_value: String(rawUrl || ""),
+        type: meta.type || inferResourceType(absoluteUrl, meta),
+        tag: meta.tag || "",
+        attr: meta.attr || "",
+        rel: meta.rel || "",
+        media: meta.media || "",
+        as: meta.as || "",
+        crossorigin: meta.crossorigin || "",
+        integrity: meta.integrity || "",
+        referrerpolicy: meta.referrerpolicy || "",
+        downloadable: /^https?:\/\//i.test(absoluteUrl)
+      });
+    };
+
+    document.querySelectorAll("link[href]").forEach((element) => {
+      const rel = element.getAttribute("rel") || "";
+      addResource(element.getAttribute("href"), {
+        tag: "link",
+        attr: "href",
+        rel,
+        media: element.getAttribute("media") || "",
+        as: element.getAttribute("as") || "",
+        crossorigin: element.getAttribute("crossorigin") || "",
+        integrity: element.getAttribute("integrity") || "",
+        referrerpolicy: element.getAttribute("referrerpolicy") || ""
+      });
+    });
+
+    document.querySelectorAll("script[src]").forEach((element) => {
+      addResource(element.getAttribute("src"), {
+        tag: "script",
+        attr: "src",
+        type: "script",
+        crossorigin: element.getAttribute("crossorigin") || "",
+        integrity: element.getAttribute("integrity") || "",
+        referrerpolicy: element.getAttribute("referrerpolicy") || ""
+      });
+    });
+
+    document.querySelectorAll("img[src], image[href], image[xlink\\:href]").forEach((element) => {
+      addResource(element.currentSrc || element.getAttribute("src") || element.getAttribute("href") || element.getAttribute("xlink:href"), {
+        tag: element.tagName.toLowerCase(),
+        attr: element.currentSrc ? "currentSrc" : "src",
+        type: "image",
+        crossorigin: element.getAttribute("crossorigin") || "",
+        referrerpolicy: element.getAttribute("referrerpolicy") || ""
+      });
+      collectSrcsetUrls(element.getAttribute("srcset")).forEach((url) => addResource(url, {
+        tag: element.tagName.toLowerCase(),
+        attr: "srcset",
+        type: "image"
+      }));
+    });
+
+    document.querySelectorAll("source[src], source[srcset]").forEach((element) => {
+      addResource(element.getAttribute("src"), {
+        tag: "source",
+        attr: "src",
+        type: inferSourceElementType(element)
+      });
+      collectSrcsetUrls(element.getAttribute("srcset")).forEach((url) => addResource(url, {
+        tag: "source",
+        attr: "srcset",
+        type: inferSourceElementType(element)
+      }));
+    });
+
+    document.querySelectorAll("video[src], video[poster], audio[src], track[src], iframe[src], embed[src], object[data]").forEach((element) => {
+      const tag = element.tagName.toLowerCase();
+      if (element.getAttribute("src")) {
+        addResource(element.getAttribute("src"), {
+          tag,
+          attr: "src",
+          type: tag === "iframe" ? "frame" : tag
+        });
+      }
+      if (element.getAttribute("poster")) {
+        addResource(element.getAttribute("poster"), {
+          tag,
+          attr: "poster",
+          type: "image"
+        });
+      }
+      if (element.getAttribute("data")) {
+        addResource(element.getAttribute("data"), {
+          tag,
+          attr: "data"
+        });
+      }
+    });
+
+    document.querySelectorAll("[style]").forEach((element) => {
+      collectCssUrls(element.getAttribute("style")).forEach((url) => addResource(url, {
+        tag: element.tagName.toLowerCase(),
+        attr: "style",
+        type: "style-resource"
+      }));
+    });
+
+    document.querySelectorAll("style").forEach((element) => {
+      collectCssUrls(element.textContent || "").forEach((url) => addResource(url, {
+        tag: "style",
+        attr: "textContent",
+        type: "style-resource"
+      }));
+    });
+
+    return entries;
+  }
+
+  function toAbsoluteUrl(value) {
+    const text = String(value || "").trim();
+    if (!text || /^(javascript|mailto|tel):/i.test(text)) return "";
+    try {
+      return new URL(text, document.baseURI).href;
+    } catch (_error) {
+      return text;
+    }
+  }
+
+  function collectSrcsetUrls(srcset) {
+    return String(srcset || "")
+      .split(",")
+      .map((candidate) => candidate.trim().split(/\s+/)[0])
+      .filter(Boolean);
+  }
+
+  function collectCssUrls(cssText) {
+    const urls = [];
+    const pattern = /url\(\s*(['"]?)(.*?)\1\s*\)/gi;
+    let match;
+    while ((match = pattern.exec(String(cssText || "")))) {
+      if (match[2]) urls.push(match[2]);
+    }
+    return urls;
+  }
+
+  function inferSourceElementType(element) {
+    const parent = element.parentElement?.tagName?.toLowerCase() || "";
+    if (parent === "picture") return "image";
+    if (parent === "video") return "video";
+    if (parent === "audio") return "audio";
+    return "source";
+  }
+
+  function inferResourceType(url, meta = {}) {
+    const rel = String(meta.rel || "").toLowerCase();
+    if (rel.includes("stylesheet")) return "stylesheet";
+    if (rel.includes("icon")) return "icon";
+    if (rel.includes("manifest")) return "manifest";
+    if (rel.includes("preload") && meta.as) return String(meta.as);
+
+    const pathname = (() => {
+      try {
+        return new URL(url).pathname.toLowerCase();
+      } catch (_error) {
+        return String(url || "").toLowerCase();
+      }
+    })();
+    if (/\.(png|jpe?g|gif|webp|avif|svg|ico)$/.test(pathname)) return "image";
+    if (/\.(css)$/.test(pathname)) return "stylesheet";
+    if (/\.(m?js)$/.test(pathname)) return "script";
+    if (/\.(woff2?|ttf|otf|eot)$/.test(pathname)) return "font";
+    if (/\.(mp4|webm|mov|m4v)$/.test(pathname)) return "video";
+    if (/\.(mp3|wav|ogg|m4a)$/.test(pathname)) return "audio";
+    return "resource";
+  }
+
+  function getSnapshotScope() {
+    const viewportHeight = Math.max(1, window.innerHeight || 1);
+    const documentHeight = getDocumentHeight();
+    const documentElementCount = document.body ? document.body.getElementsByTagName("*").length : 0;
+    const maxScrollY = Math.max(0, documentHeight - viewportHeight);
+    const fullPage = documentHeight <= FULL_PAGE_OBSERVATION_MAX_HEIGHT
+      && documentElementCount <= FULL_PAGE_OBSERVATION_MAX_DOM_ELEMENTS;
+    const marginTop = fullPage
+      ? Math.max(documentHeight, window.scrollY)
+      : Math.max(MIN_OBSERVATION_MARGIN_TOP, Math.round(viewportHeight * EXPANDED_VIEWPORT_PAGES_ABOVE));
+    const marginBottom = fullPage
+      ? documentHeight
+      : Math.max(MIN_OBSERVATION_MARGIN_BOTTOM, Math.round(viewportHeight * EXPANDED_VIEWPORT_PAGES_BELOW));
+
+    return {
+      mode: fullPage ? "full" : "expanded",
+      documentHeight,
+      documentElementCount,
+      maxScrollY,
+      marginTop,
+      marginBottom,
+      maxChars: fullPage ? OBSERVATION_FULL_MAX_CHARS : OBSERVATION_PARTIAL_MAX_CHARS,
+      maxLines: fullPage ? OBSERVATION_FULL_MAX_LINES : OBSERVATION_PARTIAL_MAX_LINES
+    };
+  }
+
+  function getDocumentHeight() {
+    const body = document.body;
+    const element = document.documentElement;
+    return Math.max(
+      body?.scrollHeight || 0,
+      body?.offsetHeight || 0,
+      element?.clientHeight || 0,
+      element?.scrollHeight || 0,
+      element?.offsetHeight || 0,
+      window.innerHeight || 0
+    );
+  }
+
+  function collectInteractiveElements(scope) {
     const selector = [
       "a[href]",
       "button",
@@ -131,8 +418,11 @@
       "[tabindex]:not([tabindex='-1'])"
     ].join(",");
 
-    const all = Array.from(document.querySelectorAll(selector));
-    const visible = all.filter(isElementUsable);
+    const interactive = Array.from(document.querySelectorAll(selector));
+    const interactiveSet = new Set(interactive);
+    const scrollable = Array.from(document.querySelectorAll("body *")).filter(isScrollableElement);
+    const all = Array.from(new Set([...interactive, ...scrollable]));
+    const visible = all.filter((element) => isElementUsable(element) && isElementInSnapshotScope(element, scope));
 
     visible.sort((a, b) => {
       const ar = a.getBoundingClientRect();
@@ -140,6 +430,9 @@
       const aInView = rectIntersectsViewport(ar) ? 0 : 1;
       const bInView = rectIntersectsViewport(br) ? 0 : 1;
       if (aInView !== bInView) return aInView - bInView;
+      const aInteractive = interactiveSet.has(a) ? 0 : 1;
+      const bInteractive = interactiveSet.has(b) ? 0 : 1;
+      if (aInteractive !== bInteractive) return aInteractive - bInteractive;
       if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
       return ar.left - br.left;
     });
@@ -151,7 +444,7 @@
     const rect = element.getBoundingClientRect();
     const label = getElementLabel(element);
     const tag = element.tagName.toLowerCase();
-    const role = element.getAttribute("role") || implicitRole(element);
+    const role = element.getAttribute("role") || implicitRole(element) || (isScrollableElement(element) ? "scrollable" : "");
     const selector = buildSelector(element);
 
     elementCache.set(id, element);
@@ -178,7 +471,7 @@
     };
   }
 
-  function buildPageObservation(targetMap, targets) {
+  function buildPageObservation(targetMap, targets, scope) {
     const targetElements = Array.from(targetMap.keys());
     const containsTargetCache = new WeakMap();
     const targetCountCache = new WeakMap();
@@ -188,12 +481,14 @@
       truncated: false,
       omittedFarBranches: 0,
       omittedHiddenBranches: 0,
-      renderedTargetIds: new Set()
+      renderedTargetIds: new Set(),
+      maxChars: scope.maxChars,
+      maxLines: scope.maxLines
     };
 
     appendObservationLine(state, `Page ${quoteText(document.title || "Untitled", 120)}`);
     appendObservationLine(state, `URL ${location.href}`);
-    appendObservationLine(state, getCoverageLine());
+    appendObservationLine(state, getCoverageLine(scope));
 
     const focusedId = getFocusedElementId(targetMap);
     if (focusedId) {
@@ -241,7 +536,7 @@
       }
 
       const target = targetMap.get(element);
-      const nearViewport = isNearViewport(element);
+      const nearViewport = isElementInSnapshotScope(element, scope);
       const containsTarget = elementContainsTarget(element);
       const descendantTargetCount = countTargetDescendants(element);
       const axNode = describeAxLikeNode(element, target) || describeComponentContainerNode(element, {
@@ -332,23 +627,28 @@
     }
   }
 
-  function getCoverageLine() {
+  function getCoverageLine(scope) {
     const scrollY = Math.round(window.scrollY);
-    const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+    const maxY = scope.maxScrollY;
     const hasAbove = scrollY > 8;
     const hasBelow = scrollY < maxY - 8;
     const percent = maxY > 0 ? Math.round((scrollY / maxY) * 100) : 100;
+
+    if (scope.mode === "full") {
+      return `Observation scope: full-page DOM view because the page is short enough. Viewport ${window.innerWidth}x${window.innerHeight}; documentHeight=${scope.documentHeight}; DOM elements=${scope.documentElementCount}; scrollY=${scrollY}/${maxY} (${percent}%).`;
+    }
+
     const coverage = [
-      hasAbove ? "content above omitted" : "at top",
-      hasBelow ? "content below omitted" : "at bottom"
+      hasAbove ? `content more than ${scope.marginTop}px above omitted` : "at top",
+      hasBelow ? `content more than ${scope.marginBottom}px below omitted` : "at bottom"
     ].join("; ");
 
-    return `Observation scope: partial viewport-centered page view; not the full page. Viewport ${window.innerWidth}x${window.innerHeight}; scrollY=${scrollY}/${maxY} (${percent}%). ${coverage}. Use scroll to inspect omitted regions.`;
+    return `Observation scope: expanded viewport-centered DOM view, not the full page. Viewport ${window.innerWidth}x${window.innerHeight}; documentHeight=${scope.documentHeight}; DOM elements=${scope.documentElementCount}; scrollY=${scrollY}/${maxY} (${percent}%). ${coverage}. Use scroll to inspect omitted regions.`;
   }
 
   function appendObservationLine(state, line) {
     const nextChars = state.chars + line.length + 1;
-    if (state.lines.length >= OBSERVATION_MAX_LINES || nextChars > OBSERVATION_MAX_CHARS) {
+    if (state.lines.length >= state.maxLines || nextChars > state.maxChars) {
       state.truncated = true;
       return false;
     }
@@ -590,10 +890,11 @@
     return true;
   }
 
-  function isNearViewport(element) {
+  function isElementInSnapshotScope(element, scope) {
     if (element === document.body || element === document.documentElement) return true;
+    if (scope.mode === "full") return true;
     const rect = element.getBoundingClientRect();
-    return rect.bottom >= -NEAR_VIEWPORT_MARGIN_TOP && rect.top <= window.innerHeight + NEAR_VIEWPORT_MARGIN_BOTTOM;
+    return rect.bottom >= -scope.marginTop && rect.top <= window.innerHeight + scope.marginBottom;
   }
 
   function getFocusedElementId(targetMap) {
@@ -619,18 +920,28 @@
     }
 
     if (type === "scroll") {
-      const amount = clamp(action.amount, 1, 5000, 700);
-      const direction = String(action.direction || "down").toLowerCase();
-      const dy = direction === "up" ? -amount : amount;
-      window.scrollBy({ top: dy, behavior: "smooth" });
-      await delay(350);
-      return { ok: true, message: `Scrolled ${direction} ${amount}px.`, scrollY: Math.round(window.scrollY) };
+      return scrollTarget(action);
     }
 
     if (type === "press_key") {
       const key = String(action.key || "Enter");
-      dispatchKey(document.activeElement || document.body, key);
-      return { ok: true, message: `Pressed ${key}.` };
+      const modifiers = getKeyModifiers(action);
+      let target = document.activeElement || document.body;
+      if (hasExplicitTarget(action)) {
+        target = resolveElement(action);
+        if (!target) {
+          return { ok: false, error: "Target element was not found.", action };
+        }
+        if (!isElementUsable(target)) {
+          return { ok: false, error: "Target element is not visible or is disabled.", label: getElementLabel(target) };
+        }
+        target.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
+        await delay(250);
+        focusElement(target);
+      }
+      dispatchKey(target, key, modifiers);
+      applySyntheticKeyDefault(target, key, modifiers);
+      return { ok: true, message: `Pressed ${formatKeyPress(key, modifiers)}.` };
     }
 
     const element = resolveElement(action);
@@ -646,10 +957,29 @@
     await delay(250);
     highlightElement(element);
 
+    if (type === "focus") {
+      focusElement(element);
+      return { ok: true, message: "Focused target.", label: getElementLabel(element).slice(0, 160) };
+    }
+
+    if (type === "hover") {
+      dispatchPointerHover(element);
+      return { ok: true, message: "Hovered target.", label: getElementLabel(element).slice(0, 160) };
+    }
+
     if (type === "click") {
-      element.focus({ preventScroll: true });
+      focusElement(element);
       dispatchPointerClick(element);
       return { ok: true, message: "Clicked target.", label: getElementLabel(element).slice(0, 160) };
+    }
+
+    if (type === "double_click") {
+      focusElement(element);
+      dispatchPointerClick(element);
+      await delay(80);
+      dispatchPointerClick(element);
+      dispatchDoubleClick(element);
+      return { ok: true, message: "Double-clicked target.", label: getElementLabel(element).slice(0, 160) };
     }
 
     if (type === "type") {
@@ -658,6 +988,15 @@
       return {
         ok: true,
         message: `Typed ${text.length} character(s).`,
+        label: getElementLabel(element).slice(0, 160)
+      };
+    }
+
+    if (type === "clear") {
+      await clearElementValue(element);
+      return {
+        ok: true,
+        message: "Cleared target.",
         label: getElementLabel(element).slice(0, 160)
       };
     }
@@ -671,6 +1010,28 @@
       element.dispatchEvent(new Event("input", { bubbles: true }));
       element.dispatchEvent(new Event("change", { bubbles: true }));
       return { ok: true, message: `Selected ${value}.` };
+    }
+
+    if (type === "set_checked") {
+      const checked = Boolean(action.checked);
+      const result = await setElementChecked(element, checked);
+      return {
+        ok: true,
+        message: result.changed ? `Set checked=${checked}.` : `Already checked=${checked}.`,
+        label: getElementLabel(element).slice(0, 160)
+      };
+    }
+
+    if (type === "drag") {
+      const deltaX = clamp(action.deltaX, -5000, 5000, 0);
+      const deltaY = clamp(action.deltaY, -5000, 5000, 0);
+      const steps = clamp(action.steps, 1, 30, 10);
+      await dragElement(element, deltaX, deltaY, steps);
+      return {
+        ok: true,
+        message: `Dragged target by ${deltaX},${deltaY}.`,
+        label: getElementLabel(element).slice(0, 160)
+      };
     }
 
     return { ok: false, error: `Unsupported executable action: ${type}` };
@@ -693,8 +1054,70 @@
     return null;
   }
 
+  async function scrollTarget(action) {
+    const amount = clamp(action.amount, 1, 5000, 700);
+    const direction = String(action.direction || "down").toLowerCase();
+    const horizontal = direction === "left" || direction === "right";
+    const delta = direction === "up" || direction === "left" ? -amount : amount;
+    const scrollOptions = {
+      top: horizontal ? 0 : delta,
+      left: horizontal ? delta : 0,
+      behavior: "smooth"
+    };
+
+    if (hasExplicitTarget(action)) {
+      const element = resolveElement(action);
+      if (!element) {
+        return { ok: false, error: "Target element was not found.", action };
+      }
+      if (!isElementUsable(element)) {
+        return { ok: false, error: "Target element is not visible or is disabled.", label: getElementLabel(element) };
+      }
+      element.scrollBy(scrollOptions);
+      await delay(350);
+      return {
+        ok: true,
+        message: `Scrolled target ${direction} ${amount}px.`,
+        scrollTop: Math.round(element.scrollTop),
+        scrollLeft: Math.round(element.scrollLeft)
+      };
+    }
+
+    window.scrollBy(scrollOptions);
+    await delay(350);
+    return {
+      ok: true,
+      message: `Scrolled page ${direction} ${amount}px.`,
+      scrollY: Math.round(window.scrollY),
+      scrollX: Math.round(window.scrollX)
+    };
+  }
+
+  function hasExplicitTarget(action) {
+    return Boolean(action?.elementId || action?.selector);
+  }
+
+  function focusElement(element) {
+    if (!isFocusable(element) && !element.hasAttribute("tabindex")) {
+      element.setAttribute("tabindex", "-1");
+    }
+    if (typeof element.focus === "function") {
+      element.focus({ preventScroll: true });
+    }
+  }
+
+  function isFocusable(element) {
+    if (!(element instanceof Element)) return false;
+    const tag = element.tagName.toLowerCase();
+    if (["button", "input", "select", "textarea", "summary"].includes(tag)) return true;
+    if (tag === "a" && element.hasAttribute("href")) return true;
+    if (element.isContentEditable) return true;
+    const tabIndex = element.getAttribute("tabindex");
+    return tabIndex != null && Number.parseInt(tabIndex, 10) >= 0;
+  }
+
   async function setText(element, text, shouldClear) {
-    element.focus({ preventScroll: true });
+    focusElement(element);
 
     if (element.isContentEditable) {
       if (shouldClear) element.textContent = "";
@@ -715,6 +1138,35 @@
     await delay(100);
   }
 
+  async function clearElementValue(element) {
+    focusElement(element);
+
+    if (element.isContentEditable) {
+      element.textContent = "";
+      element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+      await delay(100);
+      return;
+    }
+
+    if (element instanceof HTMLSelectElement) {
+      element.value = "";
+      element.selectedIndex = -1;
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      element.dispatchEvent(new Event("change", { bubbles: true }));
+      await delay(100);
+      return;
+    }
+
+    if (!("value" in element)) {
+      throw new Error("Target element does not accept text input.");
+    }
+
+    setNativeValue(element, "");
+    element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    await delay(100);
+  }
+
   function setNativeValue(element, value) {
     const prototype = Object.getPrototypeOf(element);
     const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
@@ -725,22 +1177,121 @@
     }
   }
 
+  async function setElementChecked(element, checked) {
+    focusElement(element);
+
+    if (element instanceof HTMLInputElement && ["checkbox", "radio"].includes((element.type || "").toLowerCase())) {
+      const changed = element.checked !== checked;
+      if (changed) {
+        setNativeChecked(element, checked);
+        element.dispatchEvent(new Event("input", { bubbles: true }));
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      await delay(100);
+      return { changed };
+    }
+
+    const role = (element.getAttribute("role") || "").toLowerCase();
+    if (["checkbox", "radio", "switch"].includes(role) || element.hasAttribute("aria-checked")) {
+      const current = element.getAttribute("aria-checked") === "true";
+      const changed = current !== checked;
+      if (changed) {
+        dispatchPointerClick(element);
+        await delay(100);
+        if (element.getAttribute("aria-checked") === String(current)) {
+          element.setAttribute("aria-checked", checked ? "true" : "false");
+        }
+      }
+      return { changed };
+    }
+
+    throw new Error("Target is not a checkbox, radio button, or switch.");
+  }
+
+  function setNativeChecked(element, checked) {
+    const prototype = Object.getPrototypeOf(element);
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "checked");
+    if (descriptor?.set) {
+      descriptor.set.call(element, checked);
+    } else {
+      element.checked = checked;
+    }
+  }
+
+  async function dragElement(element, deltaX, deltaY, steps) {
+    focusElement(element);
+
+    if (adjustRangeInputByDelta(element, deltaX, deltaY)) {
+      await delay(100);
+      return;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const startX = rect.left + rect.width / 2;
+    const startY = rect.top + rect.height / 2;
+    const endX = startX + deltaX;
+    const endY = startY + deltaY;
+
+    dispatchPointerMouseEvent(element, "pointerdown", startX, startY, { buttons: 1, button: 0 });
+    dispatchPointerMouseEvent(element, "mousedown", startX, startY, { buttons: 1, button: 0 });
+
+    for (let step = 1; step <= steps; step += 1) {
+      const x = startX + (deltaX * step) / steps;
+      const y = startY + (deltaY * step) / steps;
+      const target = document.elementFromPoint(x, y) || element;
+      dispatchPointerMouseEvent(target, "pointermove", x, y, { buttons: 1, button: 0 });
+      dispatchPointerMouseEvent(target, "mousemove", x, y, { buttons: 1, button: 0 });
+      await delay(16);
+    }
+
+    const dropTarget = document.elementFromPoint(endX, endY) || element;
+    dispatchPointerMouseEvent(dropTarget, "pointerup", endX, endY, { buttons: 0, button: 0 });
+    dispatchPointerMouseEvent(dropTarget, "mouseup", endX, endY, { buttons: 0, button: 0 });
+    await delay(100);
+  }
+
+  function adjustRangeInputByDelta(element, deltaX, deltaY) {
+    if (!(element instanceof HTMLInputElement) || (element.type || "").toLowerCase() !== "range") {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const min = Number.parseFloat(element.min || "0");
+    const max = Number.parseFloat(element.max || "100");
+    const current = Number.parseFloat(element.value || String(min));
+    const stepValue = element.step && element.step !== "any" ? Number.parseFloat(element.step) : 0;
+    const horizontal = Math.abs(deltaX) >= Math.abs(deltaY);
+    const ratio = horizontal
+      ? deltaX / Math.max(1, rect.width)
+      : -deltaY / Math.max(1, rect.height);
+    const raw = current + (max - min) * ratio;
+    let next = Math.min(max, Math.max(min, raw));
+
+    if (Number.isFinite(stepValue) && stepValue > 0) {
+      next = min + Math.round((next - min) / stepValue) * stepValue;
+      next = Math.min(max, Math.max(min, next));
+    }
+
+    setNativeValue(element, String(trimNumericValue(next)));
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+
+  function trimNumericValue(value) {
+    return Number.parseFloat(Number(value).toFixed(6));
+  }
+
   function dispatchPointerClick(element) {
     const rect = element.getBoundingClientRect();
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
-    const eventInit = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      clientX: x,
-      clientY: y,
-      view: window
-    };
 
     for (const eventName of ["pointerdown", "mousedown", "pointerup", "mouseup"]) {
-      const EventClass = eventName.startsWith("pointer") ? PointerEvent : MouseEvent;
-      element.dispatchEvent(new EventClass(eventName, eventInit));
+      dispatchPointerMouseEvent(element, eventName, x, y, {
+        buttons: eventName.endsWith("down") ? 1 : 0,
+        button: 0
+      });
     }
 
     if (typeof element.click === "function") {
@@ -748,16 +1299,140 @@
     }
   }
 
-  function dispatchKey(target, key) {
+  function dispatchPointerHover(element) {
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+
+    for (const eventName of ["pointerover", "mouseover", "pointerenter", "mouseenter", "pointermove", "mousemove"]) {
+      dispatchPointerMouseEvent(element, eventName, x, y);
+    }
+  }
+
+  function dispatchDoubleClick(element) {
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    dispatchPointerMouseEvent(element, "dblclick", x, y, { detail: 2 });
+  }
+
+  function dispatchPointerMouseEvent(target, eventName, x, y, extra = {}) {
+    const eventInit = {
+      bubbles: !["pointerenter", "mouseenter"].includes(eventName),
+      cancelable: true,
+      composed: true,
+      clientX: x,
+      clientY: y,
+      screenX: window.screenX + x,
+      screenY: window.screenY + y,
+      view: window,
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true,
+      ...extra
+    };
+
+    if (eventName.startsWith("pointer") && typeof PointerEvent === "function") {
+      target.dispatchEvent(new PointerEvent(eventName, eventInit));
+      return;
+    }
+
+    target.dispatchEvent(new MouseEvent(eventName, eventInit));
+  }
+
+  function dispatchKey(target, key, modifiers = {}) {
     const eventInit = {
       key,
       code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
       bubbles: true,
       cancelable: true,
-      composed: true
+      composed: true,
+      shiftKey: Boolean(modifiers.shift),
+      ctrlKey: Boolean(modifiers.ctrl),
+      altKey: Boolean(modifiers.alt),
+      metaKey: Boolean(modifiers.meta)
     };
     target.dispatchEvent(new KeyboardEvent("keydown", eventInit));
     target.dispatchEvent(new KeyboardEvent("keyup", eventInit));
+  }
+
+  function applySyntheticKeyDefault(target, key, modifiers) {
+    if (modifiers.ctrl || modifiers.alt || modifiers.meta) return;
+
+    const normalizedKey = String(key || "").toLowerCase();
+    if (normalizedKey === "tab") {
+      focusAdjacentElement(Boolean(modifiers.shift));
+      return;
+    }
+
+    if (normalizedKey === "enter") {
+      if (target instanceof HTMLTextAreaElement) return;
+      if (isActivatableElement(target)) {
+        dispatchPointerClick(target);
+        return;
+      }
+      const form = target instanceof HTMLElement ? target.form : null;
+      if (form && typeof form.requestSubmit === "function") {
+        form.requestSubmit();
+      }
+      return;
+    }
+
+    if (normalizedKey === " " || normalizedKey === "space" || normalizedKey === "spacebar") {
+      if (isActivatableElement(target)) {
+        dispatchPointerClick(target);
+      }
+    }
+  }
+
+  function focusAdjacentElement(backward) {
+    const candidates = Array.from(document.querySelectorAll([
+      "a[href]",
+      "button",
+      "input",
+      "textarea",
+      "select",
+      "summary",
+      "[contenteditable='true']",
+      "[tabindex]:not([tabindex='-1'])"
+    ].join(","))).filter(isElementUsable);
+    if (!candidates.length) return;
+
+    const activeIndex = candidates.indexOf(document.activeElement);
+    const currentIndex = activeIndex === -1 ? (backward ? 0 : -1) : activeIndex;
+    const nextIndex = backward
+      ? (currentIndex - 1 + candidates.length) % candidates.length
+      : (currentIndex + 1) % candidates.length;
+    focusElement(candidates[nextIndex]);
+  }
+
+  function isActivatableElement(element) {
+    if (!(element instanceof Element)) return false;
+    const tag = element.tagName.toLowerCase();
+    const role = (element.getAttribute("role") || "").toLowerCase();
+    if (["button", "summary"].includes(tag)) return true;
+    if (tag === "a" && element.hasAttribute("href")) return true;
+    if (element instanceof HTMLInputElement && ["button", "submit", "reset", "checkbox", "radio"].includes((element.type || "").toLowerCase())) return true;
+    return ["button", "link", "menuitem", "option", "checkbox", "radio", "switch", "tab"].includes(role);
+  }
+
+  function getKeyModifiers(action) {
+    return {
+      shift: Boolean(action.shift),
+      ctrl: Boolean(action.ctrl),
+      alt: Boolean(action.alt),
+      meta: Boolean(action.meta)
+    };
+  }
+
+  function formatKeyPress(key, modifiers) {
+    return [
+      modifiers.ctrl ? "Ctrl" : "",
+      modifiers.alt ? "Alt" : "",
+      modifiers.shift ? "Shift" : "",
+      modifiers.meta ? "Meta" : "",
+      key
+    ].filter(Boolean).join("+");
   }
 
   function getElementLabel(element) {
@@ -833,8 +1508,17 @@
 
     const rect = element.getBoundingClientRect();
     if (rect.width < 1 || rect.height < 1) return false;
-    if (rect.bottom < -200 || rect.top > window.innerHeight + 2000) return false;
     return true;
+  }
+
+  function isScrollableElement(element) {
+    if (!(element instanceof Element)) return false;
+    const style = window.getComputedStyle(element);
+    const overflowY = style.overflowY;
+    const overflowX = style.overflowX;
+    const canScrollY = ["auto", "scroll", "overlay"].includes(overflowY) && element.scrollHeight > element.clientHeight + 4;
+    const canScrollX = ["auto", "scroll", "overlay"].includes(overflowX) && element.scrollWidth > element.clientWidth + 4;
+    return canScrollY || canScrollX;
   }
 
   function isDisabled(element) {
