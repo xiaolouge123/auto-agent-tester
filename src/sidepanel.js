@@ -11,6 +11,7 @@ const elements = {
   clearLog: document.getElementById("clearLog"),
   copyResult: document.getElementById("copyResult"),
   exportResult: document.getElementById("exportResult"),
+  downloadArtifact: document.getElementById("downloadArtifact"),
   downloadRecording: document.getElementById("downloadRecording"),
   openOptions: document.getElementById("openOptions"),
   log: document.getElementById("log"),
@@ -52,6 +53,12 @@ let recordingStartedAt = "";
 let recordingEndedAt = "";
 let recordingStopPromise = null;
 let recordingKeepStreamOnStop = false;
+let currentRunCheckpointScreenshots = [];
+let currentRunCheckpoints = [];
+let currentRunFinalSnapshot = null;
+let latestRunScreenshots = [];
+let latestRunCheckpoints = [];
+let latestRunFinalSnapshot = null;
 
 connectPort();
 restoreDraft();
@@ -139,6 +146,8 @@ elements.exportResult.addEventListener("click", async () => {
     addLog("ok", "Full JSON download started.");
   } finally {
     elements.exportResult.disabled = false;
+
+    elements.downloadArtifact.disabled = false;
   }
 });
 
@@ -163,6 +172,12 @@ async function startAgentRun({
   latestSummary = null;
   activeRunTabId = null;
   currentRunLogEntries = [];
+  currentRunCheckpointScreenshots = [];
+  currentRunCheckpoints = [];
+  currentRunFinalSnapshot = null;
+  latestRunScreenshots = [];
+  latestRunCheckpoints = [];
+  latestRunFinalSnapshot = null;
   pendingRunCompletion = null;
   elements.result.textContent = "";
   elements.copyResult.disabled = true;
@@ -185,7 +200,11 @@ async function startAgentRun({
       summary: "Could not connect to background.",
       result: latestResult,
       recording: getRecordingArtifact(),
-      logs: currentRunLogEntries.slice()
+      logs: currentRunLogEntries.slice(),
+
+      screenshots: latestRunScreenshots.slice(),
+      checkpoints: latestRunCheckpoints.slice(),
+      finalSnapshot: latestRunFinalSnapshot
     });
     return { ok: false, completion: completionPromise };
   }
@@ -217,7 +236,11 @@ function connectPort() {
           summary: `Background connection lost${reason ? `: ${reason}` : ""}.`,
           result: latestResult,
           recording: getRecordingArtifact(),
-          logs: currentRunLogEntries.slice()
+          logs: currentRunLogEntries.slice(),
+
+          screenshots: latestRunScreenshots.slice(),
+          checkpoints: latestRunCheckpoints.slice(),
+          finalSnapshot: latestRunFinalSnapshot
         });
       });
       activeRunTabId = null;
@@ -292,6 +315,57 @@ function handlePortMessage(message) {
     return;
   }
 
+  if (message.type === "checkpoint") {
+    const step = Number(message.step) || 0;
+    currentRunCheckpoints = currentRunCheckpoints.filter((item) => item.step !== step);
+    currentRunCheckpoints.push({
+      step,
+      eventType: message.eventType || "website_state_stable",
+      stability: message.stability || "stable",
+      createdAt: message.createdAt || message.screenshot?.capturedAt || new Date().toISOString(),
+      page: message.page || null,
+      pageSnapshot: message.pageSnapshot ? summarizePageArchiveSnapshot(message.pageSnapshot) : null,
+      trigger: message.trigger || {},
+      screenshotError: message.screenshotError || "",
+      screenshot: message.screenshot?.dataUrl
+        ? {
+            dataUrl: message.screenshot.dataUrl,
+            mimeType: message.screenshot.mimeType || "image/png",
+            width: Number(message.screenshot.width) || 0,
+            height: Number(message.screenshot.height) || 0,
+            capturedAt: message.screenshot.capturedAt || message.createdAt || new Date().toISOString()
+          }
+        : null
+    });
+    if (message.screenshot?.dataUrl) {
+      currentRunCheckpointScreenshots = currentRunCheckpointScreenshots.filter((item) => item.step !== step);
+      currentRunCheckpointScreenshots.push({
+        step,
+        dataUrl: message.screenshot.dataUrl,
+        mimeType: message.screenshot.mimeType || "image/png",
+        width: Number(message.screenshot.width) || 0,
+        height: Number(message.screenshot.height) || 0,
+        capturedAt: message.screenshot.capturedAt || new Date().toISOString()
+      });
+    }
+    if (message.pageSnapshot) {
+      currentRunFinalSnapshot = {
+        ...message.pageSnapshot,
+        step,
+        eventType: message.eventType || "final_result_stable",
+        checkpointCapturedAt: message.createdAt || new Date().toISOString()
+      };
+    }
+    if (message.screenshotError && !message.screenshot?.dataUrl) {
+      addLog("warn", `Step ${step}: screenshot capture failed (${message.screenshotError}).`);
+    } else if (message.screenshot?.dataUrl) {
+      addLog("info", `Step ${step}: website screenshot captured (${message.eventType || "website_state_stable"}).`);
+    } else {
+      addLog("warn", `Step ${step}: no screenshot was captured.`);
+    }
+    return;
+  }
+
   if (message.type === "final") {
     completeRunFromFinalMessage(message).catch((error) => {
       addLog("error", `Could not finalize run: ${getErrorMessage(error)}`);
@@ -315,9 +389,15 @@ async function completeRunFromFinalMessage(message) {
     transcript: message.transcript || null
   };
   latestSummary = createResultSummary(latestResult);
+
+  latestRunScreenshots = currentRunCheckpointScreenshots.slice();
+  latestRunCheckpoints = currentRunCheckpoints.slice();
+  latestRunFinalSnapshot = currentRunFinalSnapshot;
   elements.result.textContent = JSON.stringify(latestSummary, null, 2);
   elements.copyResult.disabled = false;
   elements.exportResult.disabled = false;
+
+  elements.downloadArtifact.disabled = false;
   setRunning(false);
   setStatus(["fail", "error"].includes(message.status) ? "error" : "done", message.summary || message.status || "Done");
   addLog(["fail", "error"].includes(message.status) ? "error" : "ok", message.summary || "Run finished.");
@@ -329,7 +409,11 @@ async function completeRunFromFinalMessage(message) {
     summary: message.summary,
     result: latestResult,
     recording: getRecordingArtifact(),
-    logs: currentRunLogEntries.slice()
+    logs: currentRunLogEntries.slice(),
+
+    screenshots: latestRunScreenshots.slice(),
+    checkpoints: latestRunCheckpoints.slice(),
+    finalSnapshot: latestRunFinalSnapshot
   });
 }
 
@@ -347,9 +431,15 @@ async function completeRunFromErrorMessage(message) {
       transcript: message.transcript
     };
     latestSummary = createResultSummary(latestResult);
+
+    latestRunScreenshots = currentRunCheckpointScreenshots.slice();
+    latestRunCheckpoints = currentRunCheckpoints.slice();
+    latestRunFinalSnapshot = currentRunFinalSnapshot;
     elements.result.textContent = JSON.stringify(latestSummary, null, 2);
     elements.copyResult.disabled = false;
     elements.exportResult.disabled = false;
+
+    elements.downloadArtifact.disabled = false;
   }
   setStatus("error", message.message || "Error");
   addLog("error", message.message || "Unknown error.");
@@ -358,7 +448,11 @@ async function completeRunFromErrorMessage(message) {
     summary: message.message || "Error",
     result: latestResult,
     recording: getRecordingArtifact(),
-    logs: currentRunLogEntries.slice()
+    logs: currentRunLogEntries.slice(),
+
+    screenshots: latestRunScreenshots.slice(),
+    checkpoints: latestRunCheckpoints.slice(),
+    finalSnapshot: latestRunFinalSnapshot
   });
 }
 
@@ -613,6 +707,9 @@ async function exportBatchRunZip({ id, index, total, row, promptField, idField, 
     transcript: null
   };
   const recording = completed.recording || getRecordingArtifact();
+  const screenshots = Array.isArray(completed.screenshots) ? completed.screenshots : [];
+  const checkpoints = Array.isArray(completed.checkpoints) ? completed.checkpoints : [];
+  const finalSnapshot = completed.finalSnapshot || null;
   const metadata = {
     id,
     rowIndex: index + 1,
@@ -626,6 +723,29 @@ async function exportBatchRunZip({ id, index, total, row, promptField, idField, 
     status: completed.status,
     summary: completed.summary
   };
+  const runArtifact = buildRunArtifactFromResult(result, {
+    recording,
+    screenshots,
+    checkpoints,
+    finalSnapshot,
+    runId: result.transcript?.id || safeId,
+    taskId: id,
+    taskGoal: renderedGoal,
+    taskAttrs: {
+      batch_row: row,
+      batch_row_index: index + 1,
+      batch_total: total,
+      prompt_field: promptField,
+      id_field: idField,
+      goal_template: goalTemplate,
+      rendered_goal: renderedGoal
+    }
+  });
+  const assetFiles = await buildRunArtifactAssetFiles(runArtifact, {
+    recording,
+    prefix: folder
+  });
+  const exportArtifact = stripInlineArtifactData(runArtifact);
   const files = [
     {
       path: `${folder}/metadata.json`,
@@ -636,22 +756,15 @@ async function exportBatchRunZip({ id, index, total, row, promptField, idField, 
       data: JSON.stringify(result, null, 2)
     },
     {
+      path: `${folder}/run-artifact.v1.json`,
+      data: JSON.stringify(exportArtifact, null, 2)
+    },
+    {
       path: `${folder}/log.txt`,
       data: logsToText(completed.logs || [])
-    }
+    },
+    ...assetFiles
   ];
-
-  if (recording?.blob?.size > 0) {
-    files.push({
-      path: `${folder}/recording.${recording.extension || "webm"}`,
-      data: recording.blob
-    });
-  } else {
-    files.push({
-      path: `${folder}/recording-unavailable.txt`,
-      data: "Recording was unavailable or no video data was captured for this run.\n"
-    });
-  }
 
   const zipBlob = await createZipBlob(files);
   downloadBlob(zipBlob, `${safeId}.zip`);
@@ -934,7 +1047,14 @@ function resetRecordingState(options = {}) {
   recordingEndedAt = "";
   recordingStopPromise = null;
   recordingKeepStreamOnStop = false;
+  currentRunCheckpointScreenshots = [];
+  currentRunCheckpoints = [];
+  currentRunFinalSnapshot = null;
+  latestRunScreenshots = [];
+  latestRunCheckpoints = [];
+  latestRunFinalSnapshot = null;
   elements.downloadRecording.disabled = true;
+  elements.downloadArtifact.disabled = true;
 }
 
 function exportRecording() {
@@ -1386,3 +1506,862 @@ function explainRecordingError(error) {
   }
   return message;
 }
+
+
+async function exportRunArtifactArchive({ result, recording, screenshots, checkpoints, finalSnapshot, filename }) {
+  const runArtifact = buildRunArtifactFromResult(result, {
+    recording,
+    screenshots,
+    checkpoints,
+    finalSnapshot,
+    runId: result.transcript?.id || result.run_id || "run-artifact",
+    taskId: result.transcript?.id || result.run_id || "run-artifact",
+    taskGoal: result.transcript?.goal || result.summary || "Imported evaluation run"
+  });
+  const assetFiles = await buildRunArtifactAssetFiles(runArtifact, { recording });
+  const exportArtifact = stripInlineArtifactData(runArtifact);
+  const files = [
+    {
+      path: "run-artifact.v1.json",
+      data: JSON.stringify(exportArtifact, null, 2)
+    },
+    {
+      path: "result.json",
+      data: JSON.stringify(result, null, 2)
+    },
+    {
+      path: "log.txt",
+      data: logsToText(currentRunLogEntries || [])
+    },
+    ...assetFiles
+  ];
+
+  const zipBlob = await createZipBlob(files);
+  downloadBlob(
+    zipBlob,
+    filename || `${sanitizeFileName(result.transcript?.id || result.run_id || "run-artifact", "run-artifact")}.artifact.zip`
+  );
+}
+
+async function buildRunArtifactAssetFiles(runArtifact, options = {}) {
+  const prefix = options.prefix ? `${options.prefix}/` : "";
+  const recording = options.recording || null;
+  const files = [];
+  const screenshotArtifacts = (runArtifact.artifacts || []).filter((artifact) => artifact.type === "screenshot");
+  const textArtifacts = (runArtifact.artifacts || []).filter((artifact) => artifact.attrs?.data_text != null);
+  const jsonArtifacts = (runArtifact.artifacts || []).filter((artifact) => artifact.attrs?.data_json != null);
+  const resourceArtifacts = (runArtifact.artifacts || []).filter((artifact) => artifact.attrs?.evidence_role === "snapshot_resource");
+  const videoArtifact = (runArtifact.artifacts || []).find((artifact) => artifact.type === "video");
+
+  for (const artifact of screenshotArtifacts) {
+    const dataUrl = artifact.attrs?.data_url;
+    if (!dataUrl) continue;
+    files.push({
+      path: `${prefix}${artifact.uri || `artifacts/screenshots/${artifact.artifact_id}.png`}`,
+      data: await dataUrlToBlob(dataUrl)
+    });
+  }
+
+  for (const artifact of textArtifacts) {
+    files.push({
+      path: `${prefix}${artifact.uri || `artifacts/${artifact.artifact_id}.html`}`,
+      data: String(artifact.attrs?.data_text || "")
+    });
+  }
+
+  for (const artifact of jsonArtifacts) {
+    const data = artifact.attrs?.data_json;
+    if (!data) continue;
+    files.push({
+      path: `${prefix}${artifact.uri || `artifacts/${artifact.artifact_id}.json`}`,
+      data: JSON.stringify(data, null, 2)
+    });
+  }
+
+  for (const artifact of resourceArtifacts) {
+    const fetched = await fetchSnapshotResource(artifact.attrs?.original_url);
+    if (!fetched.ok) {
+      artifact.attrs = {
+        ...(artifact.attrs || {}),
+        downloaded: false,
+        fetch_error: fetched.error || "fetch failed"
+      };
+      continue;
+    }
+    artifact.mime_type = artifact.mime_type || fetched.mimeType || "application/octet-stream";
+    artifact.attrs = {
+      ...(artifact.attrs || {}),
+      downloaded: true,
+      byte_length: fetched.blob.size
+    };
+    files.push({
+      path: `${prefix}${artifact.uri}`,
+      data: fetched.blob
+    });
+  }
+
+  if (videoArtifact) {
+    if (recording?.blob?.size > 0) {
+      files.push({
+        path: `${prefix}${videoArtifact.uri || "artifacts/video.webm"}`,
+        data: recording.blob
+      });
+    } else {
+      files.push({
+        path: `${prefix}artifacts/video-unavailable.txt`,
+        data: "Recording was unavailable or no video data was captured for this run.\n"
+      });
+    }
+  }
+
+  return files;
+}
+
+function buildRunArtifactFromResult(result, options = {}) {
+  const transcript = result.transcript || {};
+  const steps = Array.isArray(transcript.steps) ? transcript.steps : [];
+  const screenshots = Array.isArray(options.screenshots) ? options.screenshots : [];
+  const checkpointRecords = Array.isArray(options.checkpoints) ? options.checkpoints : [];
+  const finalSnapshot = options.finalSnapshot || null;
+  const screenshotsByStep = new Map(screenshots.map((item) => [Number(item.step), item]));
+  const recording = options.recording || null;
+  const startedAt = parseDate(transcript.startedAt) || parseDate(recording?.startedAt) || new Date();
+  const runId = options.runId || transcript.id || result.run_id || `run_${Date.now()}`;
+  const taskId = options.taskId || transcript.id || result.run_id || runId;
+  const taskGoal = options.taskGoal || transcript.goal || result.summary || "";
+  const checkpoints = [];
+  const testerEvents = [];
+  const artifacts = [];
+  const checkpointIdByStep = new Map();
+  let screenshotCounter = 0;
+
+  if (checkpointRecords.length) {
+    for (let index = 0; index < checkpointRecords.length; index += 1) {
+      const record = checkpointRecords[index] || {};
+      const stepNumber = Number.isFinite(Number(record.step)) ? Number(record.step) : index + 1;
+      const step = steps.find((item) => Number(item.step) === stepNumber) || steps[index] || {};
+      const checkpointId = `cp_${String(index + 1).padStart(3, "0")}`;
+      const eventId = `te_${String(index + 1).padStart(3, "0")}`;
+      const page = record.page || step.toolResults?.[0]?.result?.page || step.page || {};
+      const createdAt = record.createdAt || record.screenshot?.capturedAt || step.endedAt || step.startedAt || "";
+      const elapsed = diffMs(startedAt, parseDate(createdAt) || parseDate(step.endedAt) || parseDate(step.startedAt) || startedAt);
+      const screenshotRecord = record.screenshot || screenshotsByStep.get(stepNumber);
+      let screenshotArtifactId = "";
+
+      if (screenshotRecord?.dataUrl) {
+        screenshotCounter += 1;
+        screenshotArtifactId = `shot_${String(screenshotCounter).padStart(3, "0")}`;
+        artifacts.push({
+          artifact_id: screenshotArtifactId,
+          type: "screenshot",
+          uri: `artifacts/screenshots/${screenshotArtifactId}.png`,
+          mime_type: screenshotRecord.mimeType || "image/png",
+          checkpoint_id: checkpointId,
+          video_ts_ms: Math.max(0, elapsed),
+          attrs: {
+            data_url: screenshotRecord.dataUrl,
+            width: screenshotRecord.width || 0,
+            height: screenshotRecord.height || 0,
+            captured_at: screenshotRecord.capturedAt || createdAt || ""
+          }
+        });
+      }
+
+      checkpointIdByStep.set(stepNumber, checkpointId);
+      checkpoints.push(buildCheckpointFromCapturedRecord({
+        checkpointId,
+        index,
+        eventId,
+        record,
+        step,
+        page,
+        screenshotArtifactId,
+        transcript,
+        result,
+        startedAt,
+        elapsed,
+        createdAt
+      }));
+    }
+  } else {
+    for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index] || {};
+    const stepNumber = Number.isFinite(Number(step.step)) ? Number(step.step) : index + 1;
+    const checkpointId = `cp_${String(index + 1).padStart(3, "0")}`;
+    const eventId = `te_${String(index + 1).padStart(3, "0")}`;
+    const page = step.toolResults?.[0]?.result?.page || step.page || {};
+    const elapsed = diffMs(startedAt, parseDate(step.endedAt) || parseDate(step.startedAt) || startedAt);
+    const screenshotRecord = screenshotsByStep.get(stepNumber);
+    let screenshotArtifactId = "";
+
+    if (screenshotRecord?.dataUrl) {
+      screenshotCounter += 1;
+      screenshotArtifactId = `shot_${String(screenshotCounter).padStart(3, "0")}`;
+      artifacts.push({
+        artifact_id: screenshotArtifactId,
+        type: "screenshot",
+        uri: `artifacts/screenshots/${screenshotArtifactId}.png`,
+        mime_type: screenshotRecord.mimeType || "image/png",
+        checkpoint_id: checkpointId,
+        video_ts_ms: Math.max(0, elapsed),
+        attrs: {
+          data_url: screenshotRecord.dataUrl,
+          width: screenshotRecord.width || 0,
+          height: screenshotRecord.height || 0,
+          captured_at: screenshotRecord.capturedAt || ""
+        }
+      });
+    }
+
+    checkpoints.push(buildCheckpointFromStep({
+      checkpointId,
+      index,
+      eventId,
+      step,
+      page,
+      screenshotArtifactId,
+      transcript,
+      result,
+      startedAt,
+      elapsed
+    }));
+    checkpointIdByStep.set(stepNumber, checkpointId);
+    }
+  }
+
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index] || {};
+    const stepNumber = Number.isFinite(Number(step.step)) ? Number(step.step) : index + 1;
+    const checkpointId = checkpointIdByStep.get(stepNumber) || `cp_${String(Math.min(index + 1, Math.max(1, checkpoints.length))).padStart(3, "0")}`;
+    const eventId = `te_${String(index + 1).padStart(3, "0")}`;
+    testerEvents.push(buildTesterEventFromStep(step, eventId, checkpointId, index));
+  }
+
+  if (recording?.blob?.size > 0) {
+    artifacts.unshift({
+      artifact_id: "video_001",
+      type: "video",
+      uri: "artifacts/video.webm",
+      mime_type: recording.mimeType || "video/webm"
+    });
+  } else {
+    artifacts.unshift({
+      artifact_id: "video_001",
+      type: "video",
+      mime_type: recording?.mimeType || "video/webm",
+      attrs: {
+        unavailable: true
+      }
+    });
+  }
+
+  attachEvidenceBundle({
+    checkpoints,
+    artifacts,
+    checkpointRecords,
+    finalSnapshot,
+    steps,
+    transcript,
+    result
+  });
+
+  return {
+    schema_version: "1.0",
+    run_id: runId,
+    task: {
+      task_id: taskId,
+      goal: taskGoal,
+      domain: options.domain || "unknown",
+      source: {
+        type: options.sourceType || "browser-run",
+        name: options.sourceName || transcript.tab?.title || "auto-agent-tester"
+      },
+      reference_answer: options.referenceAnswer || "",
+      expected_outcome: options.expectedOutcome || "",
+      rubric: Array.isArray(options.rubric) ? options.rubric : [],
+      attrs: {
+        migrated_from: "auto-agent-tester",
+        ...(options.taskAttrs || {})
+      }
+    },
+    run: {
+      status: result.status || transcript.final?.status || "partial",
+      started_at: transcript.startedAt || startedAt.toISOString(),
+      ended_at: transcript.endedAt || new Date().toISOString(),
+      entry_url: transcript.tab?.url || "",
+      browser: {
+        name: "Chrome",
+        version: "unknown"
+      },
+      extension: {
+        name: "auto-agent-tester",
+        version: chrome.runtime.getManifest().version
+      },
+      attrs: {
+        allowed_hosts: transcript.allowedHosts || "",
+        source_format: "auto-agent-tester-run-artifact-v1"
+      }
+    },
+    checkpoints,
+    tester_events: testerEvents,
+    annotations: Array.isArray(result.annotations) ? result.annotations : [],
+    artifacts,
+    evidence: buildEvidenceManifest({ checkpoints, artifacts }),
+    attrs: {
+      source_format: "auto-agent-tester-run-artifact-v1",
+      has_screenshots: screenshots.length > 0,
+      has_final_snapshot: Boolean(checkpoints[checkpoints.length - 1]?.snapshot_ref),
+      ...(options.runAttrs || {})
+    }
+  };
+}
+
+function attachEvidenceBundle({ checkpoints, artifacts, checkpointRecords, finalSnapshot, steps, transcript, result }) {
+  const finalCheckpoint = checkpoints[checkpoints.length - 1] || null;
+  if (!finalCheckpoint) return;
+
+  const finalSnapshotSource = finalSnapshot || getFinalSnapshotSource({ checkpointRecords, steps });
+  if (!finalSnapshotSource) return;
+
+  const snapshotHtmlArtifactId = "final_snapshot_html_001";
+  const snapshotManifestArtifactId = "final_snapshot_manifest_001";
+  const snapshotResourceArtifacts = buildSnapshotResourceArtifacts(finalSnapshotSource);
+
+  finalCheckpoint.snapshot_ref = snapshotHtmlArtifactId;
+  finalCheckpoint.attrs = {
+    ...(finalCheckpoint.attrs || {}),
+    evidence_role: "final_checkpoint",
+    final_snapshot_artifact_id: snapshotHtmlArtifactId,
+    final_snapshot_manifest_artifact_id: snapshotManifestArtifactId
+  };
+
+  if (!artifacts.some((artifact) => artifact.artifact_id === snapshotHtmlArtifactId)) {
+    artifacts.push({
+      artifact_id: snapshotHtmlArtifactId,
+      type: "html",
+      uri: "artifacts/final_snapshot/index.html",
+      mime_type: "text/html",
+      checkpoint_id: finalCheckpoint.checkpoint_id,
+      video_ts_ms: finalCheckpoint.video_ts_ms || 0,
+      attrs: {
+        evidence_role: "final_snapshot",
+        captured_at: finalSnapshotSource.captured_at || finalCheckpoint.created_at || "",
+        original_url: finalSnapshotSource.url || finalCheckpoint.page?.url || "",
+        title: finalSnapshotSource.title || finalCheckpoint.page?.title || "",
+        resource_count: Array.isArray(finalSnapshotSource.resources) ? finalSnapshotSource.resources.length : 0,
+        data_text: finalSnapshotSource.html || ""
+      }
+    });
+  }
+
+  if (!artifacts.some((artifact) => artifact.artifact_id === snapshotManifestArtifactId)) {
+    artifacts.push({
+      artifact_id: snapshotManifestArtifactId,
+      type: "json",
+      uri: "artifacts/final_snapshot/snapshot.json",
+      mime_type: "application/json",
+      checkpoint_id: finalCheckpoint.checkpoint_id,
+      video_ts_ms: finalCheckpoint.video_ts_ms || 0,
+      attrs: {
+        evidence_role: "final_snapshot_manifest",
+        data_json: {
+          schema_version: "final-page-snapshot.v1",
+          checkpoint_id: finalCheckpoint.checkpoint_id,
+          created_at: finalCheckpoint.created_at,
+          run_id: transcript.id || "",
+          task_goal: transcript.goal || result.summary || "",
+          page: summarizePageArchiveSnapshot(finalSnapshotSource),
+          resources: Array.isArray(finalSnapshotSource.resources) ? finalSnapshotSource.resources : [],
+          html_artifact_id: snapshotHtmlArtifactId,
+          resource_artifact_ids: snapshotResourceArtifacts.map((artifact) => artifact.artifact_id),
+          blocks: finalCheckpoint.blocks || [],
+          summary: finalCheckpoint.summary || "",
+          change_summary: finalCheckpoint.change_summary || "",
+          screenshot_ref: finalCheckpoint.screenshot_ref || "",
+          video_ts_ms: finalCheckpoint.video_ts_ms || 0
+        }
+      }
+    });
+  }
+
+  for (const artifact of snapshotResourceArtifacts) {
+    if (!artifacts.some((item) => item.artifact_id === artifact.artifact_id)) {
+      artifacts.push(artifact);
+    }
+  }
+}
+
+function getFinalSnapshotSource({ checkpointRecords, steps }) {
+  const finalRecord = Array.isArray(checkpointRecords) && checkpointRecords.length
+    ? checkpointRecords[checkpointRecords.length - 1]
+    : null;
+  if (finalRecord?.page) return finalRecord.page;
+
+  const finalStep = Array.isArray(steps) && steps.length ? steps[steps.length - 1] : null;
+  return finalStep?.toolResults?.[0]?.result?.page || finalStep?.page || null;
+}
+
+function summarizePageArchiveSnapshot(snapshot) {
+  if (!snapshot) return null;
+  return {
+    schema_version: snapshot.schema_version || "page-snapshot.v1",
+    capture_type: snapshot.capture_type || "final_page_snapshot",
+    captured_at: snapshot.captured_at || "",
+    url: snapshot.url || "",
+    title: snapshot.title || "",
+    base_uri: snapshot.base_uri || "",
+    text: truncate(snapshot.text || "", 8000),
+    viewport: snapshot.viewport || {},
+    scroll: snapshot.scroll || {},
+    document: snapshot.document || {},
+    resource_count: Array.isArray(snapshot.resources) ? snapshot.resources.length : 0,
+    error: snapshot.error || ""
+  };
+}
+
+function buildSnapshotResourceArtifacts(snapshot) {
+  const resources = Array.isArray(snapshot?.resources) ? snapshot.resources : [];
+  const artifacts = [];
+  const seen = new Set();
+
+  for (const resource of resources) {
+    const url = String(resource.url || "");
+    if (!/^https?:\/\//i.test(url) || seen.has(url)) continue;
+    seen.add(url);
+    const index = artifacts.length + 1;
+    const artifactId = `snapshot_res_${String(index).padStart(4, "0")}`;
+    artifacts.push({
+      artifact_id: artifactId,
+      type: "other",
+      uri: `artifacts/final_snapshot/resources/${String(index).padStart(4, "0")}-${resourceFileName(url, resource.type)}`,
+      mime_type: "",
+      attrs: {
+        evidence_role: "snapshot_resource",
+        original_url: url,
+        resource_id: resource.id || "",
+        resource_type: resource.type || "",
+        tag: resource.tag || "",
+        attr: resource.attr || "",
+        rel: resource.rel || "",
+        media: resource.media || "",
+        as: resource.as || ""
+      }
+    });
+  }
+
+  return artifacts;
+}
+
+function resourceFileName(url, type) {
+  let name = "";
+  try {
+    const parsed = new URL(url);
+    name = parsed.pathname.split("/").filter(Boolean).pop() || "";
+  } catch (_error) {
+    name = "";
+  }
+  const fallback = `resource${extensionForResourceType(type)}`;
+  return sanitizeFileName(name || fallback, fallback);
+}
+
+function extensionForResourceType(type) {
+  switch (String(type || "").toLowerCase()) {
+    case "stylesheet":
+      return ".css";
+    case "script":
+      return ".js";
+    case "image":
+    case "icon":
+      return ".img";
+    case "font":
+      return ".font";
+    case "video":
+      return ".video";
+    case "audio":
+      return ".audio";
+    case "manifest":
+      return ".json";
+    default:
+      return ".bin";
+  }
+}
+
+async function fetchSnapshotResource(url) {
+  if (!url || !/^https?:\/\//i.test(String(url))) {
+    return { ok: false, error: "not an HTTP(S) resource" };
+  }
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      cache: "force-cache",
+      redirect: "follow"
+    });
+    if (!response.ok) {
+      return { ok: false, error: `HTTP ${response.status}` };
+    }
+    const blob = await response.blob();
+    return {
+      ok: true,
+      blob,
+      mimeType: response.headers.get("content-type") || blob.type || "application/octet-stream"
+    };
+  } catch (error) {
+    return { ok: false, error: getErrorMessage(error) };
+  }
+}
+
+function stripInlineArtifactData(runArtifact) {
+  const copy = JSON.parse(JSON.stringify(runArtifact));
+  for (const artifact of copy.artifacts || []) {
+    if (!artifact.attrs) continue;
+    delete artifact.attrs.data_url;
+    delete artifact.attrs.data_json;
+    delete artifact.attrs.data_text;
+  }
+  return copy;
+}
+
+function buildEvidenceManifest({ checkpoints, artifacts }) {
+  const finalCheckpoint = checkpoints[checkpoints.length - 1] || null;
+  const video = artifacts.find((artifact) => artifact.type === "video") || null;
+  const finalSnapshot = artifacts.find((artifact) => artifact.attrs?.evidence_role === "final_snapshot") || null;
+  const finalSnapshotManifest = artifacts.find((artifact) => artifact.attrs?.evidence_role === "final_snapshot_manifest") || null;
+  const snapshotResources = artifacts.filter((artifact) => artifact.attrs?.evidence_role === "snapshot_resource");
+  const screenshots = artifacts.filter((artifact) => artifact.type === "screenshot");
+  const finalScreenshot = finalCheckpoint?.screenshot_ref
+    ? artifacts.find((artifact) => artifact.artifact_id === finalCheckpoint.screenshot_ref)
+    : null;
+
+  return {
+    video_ref: video?.artifact_id || "",
+    final_checkpoint_id: finalCheckpoint?.checkpoint_id || "",
+    final_snapshot_ref: finalSnapshot?.artifact_id || "",
+    final_snapshot_manifest_ref: finalSnapshotManifest?.artifact_id || "",
+    snapshot_resource_refs: snapshotResources.map((artifact) => artifact.artifact_id),
+    final_screenshot_ref: finalScreenshot?.artifact_id || "",
+    intermediate_screenshot_refs: screenshots
+      .filter((artifact) => !finalCheckpoint || artifact.checkpoint_id !== finalCheckpoint.checkpoint_id)
+      .map((artifact) => artifact.artifact_id),
+    checkpoint_count: checkpoints.length
+  };
+}
+
+function buildCheckpointFromStep({
+  checkpointId,
+  index,
+  eventId,
+  step,
+  page,
+  screenshotArtifactId,
+  transcript,
+  result,
+  startedAt,
+  elapsed
+}) {
+  return {
+    checkpoint_id: checkpointId,
+    index,
+    created_at: step.endedAt || step.startedAt || isoNow(startedAt, elapsed),
+    actor: "website_agent",
+    event_type: step.parsed?.final ? "final_result_stable" : "assistant_output_stable",
+    stability: "stable",
+    trigger_event_id: eventId,
+    page: buildCheckpointPage(page, transcript),
+    blocks: buildCheckpointBlocks(step, page, screenshotArtifactId, index + 1, result),
+    summary: buildCheckpointSummary(step, page, result, transcript),
+    change_summary: buildCheckpointChangeSummary(step, page, result, transcript),
+    screenshot_ref: screenshotArtifactId || undefined,
+    video_ts_ms: Math.max(0, elapsed)
+  };
+}
+
+function buildCheckpointFromCapturedRecord({
+  checkpointId,
+  index,
+  eventId,
+  record,
+  step,
+  page,
+  screenshotArtifactId,
+  transcript,
+  result,
+  startedAt,
+  elapsed,
+  createdAt
+}) {
+  return {
+    checkpoint_id: checkpointId,
+    index,
+    created_at: createdAt || step.endedAt || step.startedAt || isoNow(startedAt, elapsed),
+    actor: "website_agent",
+    event_type: record.eventType || (step.parsed?.final ? "final_result_stable" : "website_state_stable"),
+    stability: record.stability || "stable",
+    trigger_event_id: eventId,
+    page: buildCheckpointPage(page, transcript),
+    blocks: buildCheckpointBlocks(step, page, screenshotArtifactId, index + 1, result),
+    summary: buildCheckpointSummary(step, page, result, transcript),
+    change_summary: buildCheckpointChangeSummary(step, page, result, transcript),
+    screenshot_ref: screenshotArtifactId || undefined,
+    video_ts_ms: Math.max(0, elapsed),
+    attrs: {
+      source: "checkpoint_message",
+      step: Number(record.step) || index + 1,
+      trigger: record.trigger || {}
+    }
+  };
+}
+
+function buildCheckpointPage(page, transcript) {
+  const actionTargets = Array.isArray(page.actionTargets) ? page.actionTargets : [];
+  return {
+    url: page.url || transcript.tab?.url || "",
+    title: page.title || transcript.tab?.title || "",
+    viewport: page.viewport || {},
+    scroll: normalizeCheckpointScroll(page.scroll || {}),
+    active_tab: transcript.tab?.title || "",
+    section: page.section || "main_thread",
+    breadcrumb: transcript.tab?.title ? [transcript.tab.title] : [],
+    summary: page.observationText ? truncate(page.observationText, 220) : "",
+    observation_text: page.observationText ? truncate(page.observationText, 12000) : "",
+    observation_scope: page.observationScope || {},
+    action_targets: actionTargets.slice(0, 80),
+    attrs: {
+      step_summary: page.observationText ? truncate(page.observationText, 220) : "",
+      action_target_count: actionTargets.length
+    }
+  };
+}
+
+function normalizeCheckpointScroll(scroll) {
+  return {
+    ...scroll,
+    max_y: scroll.max_y ?? scroll.maxY ?? 0
+  };
+}
+
+function buildCheckpointBlocks(step, page, screenshotArtifactId, checkpointIndex, result) {
+  const blocks = [];
+  const observationText = String(page.observationText || "").trim();
+  if (observationText) {
+    blocks.push({
+      block_id: `b_${String(checkpointIndex).padStart(3, "0")}_001`,
+      type: "observation_text",
+      text: truncate(observationText, 2000),
+      order: 1,
+      source: screenshotArtifactId ? { artifact_id: screenshotArtifactId } : {},
+      attrs: {
+        source: "accessibility_tree"
+      }
+    });
+  }
+
+  const actionTargets = Array.isArray(page.actionTargets)
+    ? page.actionTargets
+    : Array.isArray(step.page?.actionTargets)
+      ? step.page.actionTargets
+      : [];
+  const targetLines = actionTargets
+    .slice(0, 6)
+    .map((target) => [target.id, target.role, target.label || target.value || target.placeholder].filter(Boolean).join(" · "))
+    .filter(Boolean);
+  if (targetLines.length) {
+    blocks.push({
+      block_id: `b_${String(checkpointIndex).padStart(3, "0")}_002`,
+      type: "action_targets",
+      text: targetLines.join("\n"),
+      order: blocks.length + 1,
+      source: screenshotArtifactId ? { artifact_id: screenshotArtifactId } : {},
+      attrs: {
+        source: "visible_targets"
+      }
+    });
+  }
+
+  const finalSummary = step.parsed?.final?.summary || result.summary || "";
+  if (step.parsed?.final?.summary || finalSummary) {
+    blocks.push({
+      block_id: `b_${String(checkpointIndex).padStart(3, "0")}_003`,
+      type: step.parsed?.final ? "final_summary" : "summary_note",
+      text: truncate(finalSummary, 1200),
+      order: blocks.length + 1,
+      source: screenshotArtifactId ? { artifact_id: screenshotArtifactId } : {}
+    });
+  }
+
+  return blocks;
+}
+
+function buildCheckpointSummary(step, page, result, transcript) {
+  return truncate(
+    page.observationText || step.actionResult?.message || step.parsed?.final?.summary || result.summary || transcript.final?.summary || "",
+    240
+  );
+}
+
+function buildCheckpointChangeSummary(step, page, result, transcript) {
+  return truncate(
+    step.actionResult?.message || step.parsed?.thought || transcript.final?.summary || result.summary || page.observationText || "",
+    320
+  );
+}
+
+function buildTesterEventFromStep(step, eventId, checkpointId, index) {
+  const action = step.parsed?.final
+    ? buildLegacyAction(step, step.parsed?.final, "finish", null)
+    : buildLegacyAction(
+        step,
+        step.parsed?.action || step.actionResult?.action || null,
+        normalizeActionType(step.parsed?.action?.type || step.actionResult?.action?.type),
+        step.actionResult || step.toolResults?.[0]?.result || null
+      );
+
+  return {
+    event_id: eventId,
+    index,
+    created_at: step.startedAt || step.endedAt || new Date().toISOString(),
+    actor: "tester",
+    action,
+    before_checkpoint_id: index > 0 ? `cp_${String(index).padStart(3, "0")}` : undefined,
+    after_checkpoint_id: checkpointId
+  };
+}
+
+function buildLegacyAction(step, action, actionType, actionResult) {
+  const nextAction = {
+    type: actionType || "unknown"
+  };
+
+  if (action?.elementId || step.parsed?.action?.elementId) {
+    nextAction.target = {
+      element_id: action?.elementId || step.parsed?.action?.elementId
+    };
+  }
+
+  if (action?.selector || step.parsed?.action?.selector) {
+    nextAction.target = {
+      ...(nextAction.target || {}),
+      selector: action?.selector || step.parsed?.action?.selector
+    };
+  }
+
+  if (action?.text != null) {
+    nextAction.input = { ...(nextAction.input || {}), text: action.text };
+  }
+  if (action?.value != null) {
+    nextAction.input = { ...(nextAction.input || {}), value: action.value };
+  }
+  if (action?.key != null) {
+    nextAction.input = { ...(nextAction.input || {}), key: action.key };
+  }
+  if (action?.direction != null) {
+    nextAction.input = { ...(nextAction.input || {}), direction: action.direction };
+  }
+  if (action?.amount != null) {
+    nextAction.input = { ...(nextAction.input || {}), amount: action.amount };
+  }
+  if (action?.ms != null) {
+    nextAction.input = { ...(nextAction.input || {}), ms: action.ms };
+  }
+  if (action?.checked != null) {
+    nextAction.input = { ...(nextAction.input || {}), checked: action.checked };
+  }
+  for (const modifier of ["shift", "ctrl", "alt", "meta"]) {
+    if (action?.[modifier] != null) {
+      nextAction.input = { ...(nextAction.input || {}), [modifier]: action[modifier] };
+    }
+  }
+  if (action?.deltaX != null) {
+    nextAction.input = { ...(nextAction.input || {}), deltaX: action.deltaX };
+  }
+  if (action?.deltaY != null) {
+    nextAction.input = { ...(nextAction.input || {}), deltaY: action.deltaY };
+  }
+  if (action?.steps != null) {
+    nextAction.input = { ...(nextAction.input || {}), steps: action.steps };
+  }
+  if (step.parsed?.final) {
+    nextAction.input = {
+      ...(nextAction.input || {}),
+      status: step.parsed.final.status,
+      summary: step.parsed.final.summary,
+      data: step.parsed.final.data
+    };
+    nextAction.result = {
+      ok: true,
+      status: step.parsed.final.status,
+      message: step.parsed.final.summary || step.parsed.final.status,
+      data: step.parsed.final.data ?? null
+    };
+    return nextAction;
+  }
+
+  nextAction.result = {
+    ok: Boolean(actionResult?.ok),
+    message: actionResult?.message || actionResult?.error || "",
+    error: actionResult?.error || ""
+  };
+
+  return nextAction;
+}
+
+function normalizeActionType(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return "unknown";
+  if (text === "type_text") return "type_text";
+  if (text === "select_option") return "select_option";
+  if (text === "press_key") return "press_key";
+  if (text === "scroll") return "scroll";
+  if (text === "wait") return "wait";
+  if (text === "click") return "click";
+  if (text === "finish") return "finish";
+  return text;
+}
+
+function parseDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function diffMs(start, end) {
+  return Math.max(0, Math.round(end.getTime() - start.getTime()));
+}
+
+function isoNow(start, offsetMs) {
+  return new Date(start.getTime() + Math.max(0, offsetMs)).toISOString();
+}
+
+function truncate(text, maxLength) {
+  const value = String(text || "");
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 3)}...`;
+}
+
+async function dataUrlToBlob(dataUrl) {
+  const response = await fetch(dataUrl);
+  return response.blob();
+}
+
+
+
+elements.downloadArtifact.addEventListener("click", async () => {
+  if (!latestResult) return;
+  elements.downloadArtifact.disabled = true;
+  addLog("info", "Preparing artifact archive download.");
+  await delayFrame();
+  try {
+    await exportRunArtifactArchive({
+      result: latestResult,
+      recording: getRecordingArtifact(),
+      screenshots: latestRunScreenshots.slice(),
+      checkpoints: latestRunCheckpoints.slice(),
+      finalSnapshot: latestRunFinalSnapshot,
+      filename: sanitizeFileName(latestResult.transcript?.id || latestResult.summary || "run-artifact", "run-artifact") + ".artifact.zip"
+    });
+    addLog("ok", "Artifact archive download started.");
+  } catch (error) {
+    addLog("error", "Could not export artifact archive: " + getErrorMessage(error));
+  } finally {
+    elements.downloadArtifact.disabled = false;
+  }
+});
