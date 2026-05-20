@@ -16,6 +16,22 @@
         <button id="openOptions" class="options-button" title="Options" aria-label="Options">Options</button>
       </header>
 
+      <section class="record-bar">
+        <button id="recordToggle" class="record">Start Recording</button>
+        <span id="recordStatus" class="muted">No reference saved</span>
+        <button id="recordClear" class="ghost" hidden>Clear</button>
+      </section>
+      <details id="recordPreview" class="record-preview" hidden>
+        <summary>Reference flow (click to expand)</summary>
+        <pre id="recordPreviewText"></pre>
+        <textarea id="recordPreviewEdit" rows="8" hidden></textarea>
+        <div class="record-preview-actions">
+          <button id="recordEdit" class="ghost">Edit</button>
+          <button id="recordSave" class="ghost" hidden>Save</button>
+          <button id="recordCancelEdit" class="ghost" hidden>Cancel</button>
+        </div>
+      </details>
+
       <section class="field">
         <label for="goal">Goal</label>
         <textarea id="goal" rows="7" placeholder="Example: Search the product catalog for wireless keyboard, open the first result, and collect title, price, and availability. Batch template: {{prompt}}"></textarea>

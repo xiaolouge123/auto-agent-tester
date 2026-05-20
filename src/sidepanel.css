@@ -309,3 +309,86 @@ input {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+.record-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+button.record {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #fff;
+}
+
+button.record:hover:not(:disabled) {
+  background: #8f1c14;
+}
+
+button.ghost {
+  border-color: var(--border);
+  background: transparent;
+  color: var(--muted);
+}
+
+button.ghost:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--muted);
+}
+
+.record-bar #recordStatus {
+  flex: 1;
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-preview {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.record-preview summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.record-preview pre {
+  margin: 8px 0 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.record-preview textarea {
+  width: 100%;
+  margin: 8px 0 0 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.record-preview-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  justify-content: flex-end;
+}

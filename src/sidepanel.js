@@ -18,7 +18,16 @@ const elements = {
   result: document.getElementById("result"),
   statusDot: document.getElementById("statusDot"),
   statusText: document.getElementById("statusText"),
-  tabInfo: document.getElementById("tabInfo")
+  tabInfo: document.getElementById("tabInfo"),
+  recordToggle: document.getElementById("recordToggle"),
+  recordStatus: document.getElementById("recordStatus"),
+  recordClear: document.getElementById("recordClear"),
+  recordPreview: document.getElementById("recordPreview"),
+  recordPreviewText: document.getElementById("recordPreviewText"),
+  recordPreviewEdit: document.getElementById("recordPreviewEdit"),
+  recordEdit: document.getElementById("recordEdit"),
+  recordSave: document.getElementById("recordSave"),
+  recordCancelEdit: document.getElementById("recordCancelEdit")
 };
 
 const RECORDING_MIME_TYPES = [
@@ -60,8 +69,95 @@ let latestRunScreenshots = [];
 let latestRunCheckpoints = [];
 let latestRunFinalSnapshot = null;
 
+let referenceRecordingActive = false;
+let referenceRecordingStartedAt = 0;
+let referenceRecordingEventCount = 0;
+let referenceRecordingTimer = null;
+
 connectPort();
 restoreDraft();
+loadReferenceState();
+
+elements.recordToggle.addEventListener("click", async () => {
+  if (referenceRecordingActive) {
+    elements.recordToggle.disabled = true;
+    elements.recordToggle.textContent = "Summarizing...";
+    postToAgent({ type: "STOP_RECORDING" });
+    return;
+  }
+  if (runActive) {
+    addLog("error", "Stop the agent run before starting a recording.");
+    return;
+  }
+  let tabId = null;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = tab?.id || null;
+    if (!tab?.url || !/^https?:\/\//i.test(tab.url)) {
+      addLog("error", "Recording only works on http/https pages. Switch to a webpage and try again.");
+      return;
+    }
+  } catch (error) {
+    addLog("error", `Could not read active tab: ${getErrorMessage(error)}`);
+    return;
+  }
+  postToAgent({ type: "START_RECORDING", payload: { tabId } });
+});
+
+elements.recordClear.addEventListener("click", () => {
+  postToAgent({ type: "CLEAR_REFERENCE" });
+});
+
+elements.recordEdit.addEventListener("click", () => {
+  const currentText = elements.recordPreviewText.textContent;
+  elements.recordPreviewEdit.value = currentText;
+  elements.recordPreviewText.hidden = true;
+  elements.recordPreviewEdit.hidden = false;
+  elements.recordEdit.hidden = true;
+  elements.recordSave.hidden = false;
+  elements.recordCancelEdit.hidden = false;
+});
+
+elements.recordCancelEdit.addEventListener("click", () => {
+  elements.recordPreviewText.hidden = false;
+  elements.recordPreviewEdit.hidden = true;
+  elements.recordEdit.hidden = false;
+  elements.recordSave.hidden = true;
+  elements.recordCancelEdit.hidden = true;
+});
+
+elements.recordSave.addEventListener("click", async () => {
+  const newSummary = elements.recordPreviewEdit.value.trim();
+  if (!newSummary) {
+    addLog("error", "Reference summary cannot be empty.");
+    return;
+  }
+  elements.recordSave.disabled = true;
+  try {
+    const data = await chrome.storage.local.get(REFERENCE_STORAGE_KEY);
+    const reference = data?.[REFERENCE_STORAGE_KEY];
+    if (!reference) {
+      addLog("error", "No reference to update.");
+      return;
+    }
+    reference.summary = newSummary;
+    reference.editedAt = new Date().toISOString();
+    await chrome.storage.local.set({ [REFERENCE_STORAGE_KEY]: reference });
+    applyReferenceState(reference);
+    elements.recordPreviewText.hidden = false;
+    elements.recordPreviewEdit.hidden = true;
+    elements.recordEdit.hidden = false;
+    elements.recordSave.hidden = true;
+    elements.recordCancelEdit.hidden = true;
+    addLog("ok", "Reference flow updated.");
+  } catch (error) {
+    addLog("error", `Could not save: ${getErrorMessage(error)}`);
+  } finally {
+    elements.recordSave.disabled = false;
+  }
+});
+
+const REFERENCE_STORAGE_KEY = "referenceExample";
 
 elements.startRun.addEventListener("click", async () => {
   const goal = elements.goal.value.trim();
@@ -377,6 +473,65 @@ function handlePortMessage(message) {
     completeRunFromErrorMessage(message).catch((error) => {
       addLog("error", `Could not finalize error: ${getErrorMessage(error)}`);
     });
+    return;
+  }
+
+  if (message.type === "RECORDING_STARTED") {
+    referenceRecordingActive = true;
+    referenceRecordingStartedAt = Date.parse(message.startedAt) || Date.now();
+    referenceRecordingEventCount = 0;
+    updateRecordingButtonLabel();
+    referenceRecordingTimer = window.setInterval(updateRecordingButtonLabel, 1000);
+    elements.recordToggle.disabled = false;
+    elements.recordClear.hidden = true;
+    elements.recordStatus.textContent = `Recording on ${truncate(message.startUrl || "", 40)}`;
+    addLog("info", "Recording started. Operate the page; click Stop Recording when done.");
+    return;
+  }
+
+  if (message.type === "RECORDING_EVENT_TICK") {
+    referenceRecordingEventCount = message.count || 0;
+    updateRecordingButtonLabel();
+    return;
+  }
+
+  if (message.type === "RECORDING_SUMMARIZING") {
+    stopRecordingTimer();
+    elements.recordToggle.disabled = true;
+    elements.recordToggle.textContent = "Summarizing...";
+    elements.recordStatus.textContent = `Summarizing ${message.eventCount || referenceRecordingEventCount} event(s)...`;
+    addLog("info", `Captured ${message.eventCount || referenceRecordingEventCount} event(s). Asking the model to summarize.`);
+    return;
+  }
+
+  if (message.type === "RECORDING_SUMMARIZED") {
+    referenceRecordingActive = false;
+    stopRecordingTimer();
+    elements.recordToggle.disabled = false;
+    elements.recordToggle.textContent = "Start Recording";
+    applyReferenceState(message.reference);
+    addLog("ok", "Reference flow saved. It will be injected into future Agent runs.");
+    return;
+  }
+
+  if (message.type === "RECORDING_ERROR") {
+    referenceRecordingActive = false;
+    stopRecordingTimer();
+    elements.recordToggle.disabled = false;
+    elements.recordToggle.textContent = "Start Recording";
+    addLog("error", `Recording error: ${message.message || "unknown"}`);
+    return;
+  }
+
+  if (message.type === "REFERENCE_STATE") {
+    applyReferenceState(message.reference);
+    return;
+  }
+
+  if (message.type === "REFERENCE_CLEARED") {
+    applyReferenceState(null);
+    addLog("ok", "Reference flow cleared.");
+    return;
   }
 }
 
@@ -470,6 +625,47 @@ async function restoreDraft() {
   const data = await chrome.storage.local.get({ lastGoal: "", lastMaxStep: 0, lastMaxSteps: DEFAULT_MAX_STEP });
   elements.goal.value = data.lastGoal || "";
   elements.maxStep.value = data.lastMaxStep || data.lastMaxSteps || DEFAULT_MAX_STEP;
+}
+
+function loadReferenceState() {
+  postToAgent({ type: "GET_REFERENCE" });
+}
+
+function applyReferenceState(reference) {
+  if (reference?.summary) {
+    const dateLabel = reference.summarizedAt || reference.recordedAt;
+    const date = dateLabel ? new Date(dateLabel) : null;
+    const dateText = date && !Number.isNaN(date.getTime()) ? date.toLocaleString() : "unknown time";
+    elements.recordStatus.textContent = `Reference saved · ${reference.eventCount || 0} events · ${dateText}`;
+    elements.recordClear.hidden = false;
+    elements.recordPreview.hidden = false;
+    elements.recordPreviewText.textContent = reference.summary;
+  } else {
+    elements.recordStatus.textContent = "No reference saved";
+    elements.recordClear.hidden = true;
+    elements.recordPreview.hidden = true;
+    elements.recordPreviewText.textContent = "";
+  }
+}
+
+function updateRecordingButtonLabel() {
+  if (!referenceRecordingActive) return;
+  const elapsedMs = Date.now() - referenceRecordingStartedAt;
+  const elapsedSec = Math.max(0, Math.round(elapsedMs / 1000));
+  elements.recordToggle.textContent = `Stop Recording (${referenceRecordingEventCount} events · ${elapsedSec}s)`;
+}
+
+function stopRecordingTimer() {
+  if (referenceRecordingTimer !== null) {
+    window.clearInterval(referenceRecordingTimer);
+    referenceRecordingTimer = null;
+  }
+}
+
+function truncate(str, max) {
+  const s = String(str || "");
+  if (s.length <= max) return s;
+  return `${s.slice(0, Math.max(0, max - 1))}…`;
 }
 
 function setRunning(isRunning) {

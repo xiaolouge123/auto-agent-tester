@@ -30,6 +30,18 @@ const activeAgentRuns = new Map();
 let runKeepAliveCount = 0;
 let runKeepAliveInterval = null;
 
+const REFERENCE_STORAGE_KEY = "referenceExample";
+const RECORDING_SUMMARY_MIN_CHARS = 200;
+const RECORDING_SUMMARY_MAX_CHARS = 500;
+const recordingState = {
+  active: false,
+  tabId: null,
+  startedAt: null,
+  startUrl: "",
+  events: [],
+  port: null
+};
+
 initializeSidePanelBehavior();
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -43,8 +55,13 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
-  if (message?.type === "CONTENT_READY" && sender.tab?.id && activeAgentTabs.has(sender.tab.id)) {
-    setAgentActivity(sender.tab.id, true).catch(() => {});
+  if (message?.type === "CONTENT_READY" && sender.tab?.id) {
+    if (activeAgentTabs.has(sender.tab.id)) {
+      setAgentActivity(sender.tab.id, true).catch(() => {});
+    }
+    if (recordingState.active && sender.tab.id === recordingState.tabId) {
+      sendTabRecordingMessage(sender.tab.id, { type: "START_RECORDING" }).catch(() => {});
+    }
   }
 
   if (message?.type === "STOP_AGENT_FROM_PAGE" && sender.tab?.id) {
@@ -56,6 +73,19 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       setAgentActivity(sender.tab.id, false).catch(() => {});
     }
   }
+
+  if (message?.type === "RECORDING_EVENT" && message.event) {
+    if (recordingState.active && (!recordingState.tabId || sender.tab?.id === recordingState.tabId)) {
+      recordingState.events.push(message.event);
+      if (recordingState.port) {
+        post(recordingState.port, {
+          type: "RECORDING_EVENT_TICK",
+          count: recordingState.events.length,
+          lastEvent: { type: message.event.type, ts: message.event.ts }
+        });
+      }
+    }
+  }
 });
 
 chrome.runtime.onConnect.addListener((port) => {
@@ -64,6 +94,20 @@ chrome.runtime.onConnect.addListener((port) => {
   const state = createRunState();
 
   port.onDisconnect.addListener(() => {
+    if (recordingState.active && recordingState.port === port) {
+      const tabId = recordingState.tabId;
+      recordingState.active = false;
+      recordingState.tabId = null;
+      recordingState.events = [];
+      recordingState.startedAt = null;
+      recordingState.startUrl = "";
+      recordingState.port = null;
+      stopRunKeepAlive();
+      if (tabId != null) {
+        sendTabRecordingMessage(tabId, { type: "STOP_RECORDING" }).catch(() => {});
+      }
+    }
+
     if (!state.running && !state.tabId) return;
 
     state.cancelled = true;
@@ -114,6 +158,32 @@ chrome.runtime.onConnect.addListener((port) => {
 
     if (message?.type === "STOP_AGENT") {
       requestStop(port, state);
+    }
+
+    if (message?.type === "START_RECORDING") {
+      startRecording(port, message.payload || {}).catch((error) => {
+        post(port, { type: "RECORDING_ERROR", message: getErrorMessage(error) });
+      });
+    }
+
+    if (message?.type === "STOP_RECORDING") {
+      stopRecording(port).catch((error) => {
+        post(port, { type: "RECORDING_ERROR", message: getErrorMessage(error) });
+      });
+    }
+
+    if (message?.type === "CLEAR_REFERENCE") {
+      chrome.storage.local.remove(REFERENCE_STORAGE_KEY).then(() => {
+        post(port, { type: "REFERENCE_CLEARED" });
+      }).catch((error) => {
+        post(port, { type: "RECORDING_ERROR", message: getErrorMessage(error) });
+      });
+    }
+
+    if (message?.type === "GET_REFERENCE") {
+      chrome.storage.local.get(REFERENCE_STORAGE_KEY).then((data) => {
+        post(port, { type: "REFERENCE_STATE", reference: data?.[REFERENCE_STORAGE_KEY] || null });
+      }).catch(() => {});
     }
   });
 });
@@ -206,7 +276,12 @@ async function runAgent(port, state, payload) {
   try {
     let currentSnapshot = await getSnapshot(tab.id);
     let step = 1;
-    const messages = buildMessages(goal, step, currentSnapshot, observations);
+    const referenceExample = await loadReferenceExample();
+    if (referenceExample?.summary) {
+      post(port, { type: "log", level: "info", message: `Using human-recorded reference flow (${referenceExample.eventCount || 0} events).` });
+      addTranscriptEvent(state, { type: "reference_flow_injected", recordedAt: referenceExample.recordedAt, eventCount: referenceExample.eventCount });
+    }
+    const messages = buildMessages(goal, step, currentSnapshot, observations, referenceExample);
 
     while (step <= maxStep) {
       if (state.cancelled) {
@@ -776,8 +851,8 @@ async function setAgentActivity(tabId, active) {
   }
 }
 
-function buildMessages(goal, step, snapshot, observations) {
-  const system = [
+function buildMessages(goal, step, snapshot, observations, referenceExample) {
+  const systemLines = [
     "You are a browser QA and data-collection agent.",
     "You inspect compact accessibility-tree-like page observations and choose exactly one next browser tool call.",
     "Do not output JSON actions in assistant content. Use the provided tools for every browser action and use finish when the task is complete or impossible.",
@@ -789,7 +864,19 @@ function buildMessages(goal, step, snapshot, observations) {
     "Use done when the requested test/data collection goal is complete.",
     "Tool results include the updated page observation for the next step.",
     "Do not complete purchases, submit payments, bypass CAPTCHAs, or perform irreversible production actions unless the goal explicitly says this is a test environment and the page clearly confirms it."
-  ].join("\n");
+  ];
+
+  if (referenceExample?.summary) {
+    systemLines.push(
+      "",
+      "Reference flow recorded by a human operator (use it as a strong hint for ordering and key decision points; parameters in the current task may differ from those in the recording, adapt as needed and do not copy values verbatim). The reference flow ends with an explicit terminal condition: as soon as the current page state matches that condition for the current Goal, call the finish tool with status 'done' and stop — do not continue performing additional actions beyond the terminal condition described in the reference.",
+      "---",
+      String(referenceExample.summary).trim(),
+      "---"
+    );
+  }
+
+  const system = systemLines.join("\n");
 
   const recentObservations = observations.length
     ? JSON.stringify(observations.slice(-6), null, 2)
@@ -1420,4 +1507,224 @@ function post(port, message) {
   } catch (error) {
     console.warn("Could not post message to panel", error);
   }
+}
+
+async function loadReferenceExample() {
+  try {
+    const data = await chrome.storage.local.get(REFERENCE_STORAGE_KEY);
+    return data?.[REFERENCE_STORAGE_KEY] || null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function startRecording(port, payload) {
+  if (recordingState.active) {
+    post(port, { type: "RECORDING_ERROR", message: "A recording is already in progress." });
+    return;
+  }
+
+  let tabId = payload?.tabId;
+  if (!tabId) {
+    const tab = await getActiveTab();
+    tabId = tab?.id;
+  }
+  if (!tabId) {
+    throw new Error("No active tab to record.");
+  }
+
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (_error) {
+    throw new Error("Recording target tab is not accessible.");
+  }
+  if (!tab?.url || !/^https?:\/\//i.test(tab.url)) {
+    throw new Error("Recording only works on http and https pages.");
+  }
+
+  recordingState.active = true;
+  recordingState.tabId = tabId;
+  recordingState.startedAt = new Date().toISOString();
+  recordingState.startUrl = tab.url;
+  recordingState.events = [];
+  recordingState.port = port;
+  startRunKeepAlive();
+
+  try {
+    await sendTabRecordingMessage(tabId, { type: "START_RECORDING" });
+  } catch (error) {
+    recordingState.active = false;
+    recordingState.tabId = null;
+    recordingState.port = null;
+    stopRunKeepAlive();
+    throw error;
+  }
+
+  post(port, {
+    type: "RECORDING_STARTED",
+    startedAt: recordingState.startedAt,
+    startUrl: recordingState.startUrl,
+    tabId
+  });
+}
+
+async function stopRecording(port) {
+  if (!recordingState.active) {
+    post(port, { type: "RECORDING_ERROR", message: "No active recording." });
+    return;
+  }
+
+  const tabId = recordingState.tabId;
+  const lastEvent = recordingState.events[recordingState.events.length - 1];
+  recordingState.events.push({
+    type: "stop",
+    url: lastEvent?.url || recordingState.startUrl || "",
+    title: lastEvent?.title || "",
+    ts: new Date().toISOString(),
+    note: "Recording stopped here — the human operator considered the task complete at this point. The page state shown in the immediately preceding event is the terminal state."
+  });
+  const events = recordingState.events.slice();
+  const startedAt = recordingState.startedAt;
+  const startUrl = recordingState.startUrl;
+
+  recordingState.active = false;
+  recordingState.tabId = null;
+  recordingState.events = [];
+  recordingState.startedAt = null;
+  recordingState.startUrl = "";
+  recordingState.port = null;
+
+  if (tabId != null) {
+    sendTabRecordingMessage(tabId, { type: "STOP_RECORDING" }).catch(() => {});
+  }
+
+  if (events.length === 0) {
+    stopRunKeepAlive();
+    post(port, { type: "RECORDING_ERROR", message: "No events captured during recording." });
+    return;
+  }
+
+  post(port, { type: "RECORDING_SUMMARIZING", eventCount: events.length });
+
+  try {
+    let summary;
+    try {
+      summary = await summarizeRecording(events, { startUrl, startedAt });
+    } catch (error) {
+      post(port, { type: "RECORDING_ERROR", message: `Summary failed: ${getErrorMessage(error)}` });
+      return;
+    }
+
+    const reference = {
+      summary,
+      recordedAt: startedAt,
+      summarizedAt: new Date().toISOString(),
+      eventCount: events.length,
+      startUrl
+    };
+    await chrome.storage.local.set({ [REFERENCE_STORAGE_KEY]: reference });
+    post(port, { type: "RECORDING_SUMMARIZED", reference });
+  } finally {
+    stopRunKeepAlive();
+  }
+}
+
+async function summarizeRecording(events, context) {
+  const settings = await loadSettings();
+  assertSettings(settings);
+
+  const compact = events.map((event, index) => ({
+    i: index + 1,
+    type: event.type,
+    target: event.target ? {
+      tag: event.target.tag,
+      role: event.target.role,
+      label: event.target.label,
+      placeholder: event.target.placeholder,
+      name: event.target.name,
+      value: event.target.value,
+      href: event.target.href
+    } : null,
+    value: event.value,
+    key: event.key,
+    modifiers: event.modifiers,
+    scroll: event.scroll,
+    url: event.url,
+    title: event.title,
+    pageBrief: event.snapshotBrief?.textBrief || ""
+  }));
+
+  const systemPrompt = [
+    "You are a browser operation flow analyst.",
+    "You will receive a chronological sequence of user interactions captured during a human recording: clicks, inputs, key presses, submits, and scroll events, together with the page title/URL and a short text snapshot of the page at the time of each event. The final event always has type 'stop' — it marks the moment the human operator considered the task complete; the page state described in the event immediately before 'stop' is the terminal state of a successful run.",
+    "Produce a single self-contained paragraph in fluent natural language (no numbered list, no JSON, no markdown headings) that describes the operation flow as a reusable reference for an automation agent.",
+    "Requirements:",
+    "- Describe order, intent, and key decision points using connective language like 'first ... then ... if ... otherwise ...'.",
+    "- Refer to UI elements by semantic names (e.g. 'the search input in the top bar'), never by raw CSS selectors.",
+    "- Do not invent steps that did not occur in the recording.",
+    "- Treat captured input/search values as illustrative examples; explicitly note that real parameters may differ.",
+    "- End the paragraph with an explicit terminal-condition sentence in the form 'The task is complete once <observable page state>, at which point the run should finish.' — describe what visibly indicates success based on the last few events before 'stop'.",
+    `- Target length: between ${RECORDING_SUMMARY_MIN_CHARS} and ${RECORDING_SUMMARY_MAX_CHARS} characters.`,
+    "- Respond with the paragraph only, no preface."
+  ].join("\n");
+
+  const userPrompt = [
+    `Recording started at: ${context.startedAt}`,
+    `Start URL: ${context.startUrl}`,
+    `Event count: ${events.length}`,
+    "Events (JSON):",
+    JSON.stringify(compact, null, 2)
+  ].join("\n");
+
+  const endpoint = `${settings.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const body = {
+    model: settings.model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ],
+    temperature: Number(settings.temperature) || 0.2
+  };
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 120 * 1000);
+  let attempt;
+  try {
+    attempt = await performChatCompletionAttempt(endpoint, settings.apiKey, body, controller.signal);
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw new Error("Summary request timed out after 120 seconds.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+  if (!attempt.response.ok) {
+    throw new Error(`LLM request failed (${attempt.response.status}): ${attempt.responseText.slice(0, 300)}`);
+  }
+  const choice = attempt.responseJson?.choices?.[0];
+  const content = getAssistantContent(choice?.message || {}) || (typeof choice?.message?.content === "string" ? choice.message.content : "");
+  const text = String(content || "").trim();
+  if (!text) {
+    throw new Error("Model returned an empty summary.");
+  }
+  return text;
+}
+
+async function sendTabRecordingMessage(tabId, message) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.tabs.sendMessage(tabId, message, (response) => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          reject(new Error(err.message || "Tab message failed."));
+          return;
+        }
+        resolve(response);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
 }

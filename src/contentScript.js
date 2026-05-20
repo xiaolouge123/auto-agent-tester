@@ -7,6 +7,19 @@
   let activityOverlay;
   let activityStyle;
 
+  const recordingState = {
+    active: false,
+    listeners: [],
+    pendingInputs: new Map(),
+    lastScrollAt: 0
+  };
+  const RECORDING_SCROLL_THROTTLE_MS = 1000;
+  const RECORDING_SNAPSHOT_BRIEF_CHARS = 800;
+  const RECORDING_SEMANTIC_KEYS = new Set([
+    "Enter", "Tab", "Escape",
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"
+  ]);
+
   const MAX_ACTION_TARGETS = 220;
   const OBSERVATION_PARTIAL_MAX_CHARS = 20000;
   const OBSERVATION_PARTIAL_MAX_LINES = 360;
@@ -75,6 +88,23 @@
     if (message?.type === "SET_AGENT_ACTIVITY") {
       setAgentActivity(Boolean(message.active));
       sendResponse({ ok: true });
+      return false;
+    }
+
+    if (message?.type === "START_RECORDING") {
+      startRecording();
+      sendResponse({ ok: true, active: recordingState.active });
+      return false;
+    }
+
+    if (message?.type === "STOP_RECORDING") {
+      stopRecording();
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    if (message?.type === "RECORDING_STATUS") {
+      sendResponse({ active: recordingState.active });
       return false;
     }
 
@@ -1796,5 +1826,200 @@
     if (!error) return "Unknown error.";
     if (typeof error === "string") return error;
     return error.message || String(error);
+  }
+
+  function startRecording() {
+    if (recordingState.active) return;
+    recordingState.active = true;
+    recordingState.pendingInputs.clear();
+    recordingState.lastScrollAt = 0;
+
+    const addListener = (target, type, handler, options) => {
+      target.addEventListener(type, handler, options);
+      recordingState.listeners.push({ target, type, handler, options });
+    };
+
+    addListener(document, "click", handleRecordedClick, true);
+    addListener(document, "change", handleRecordedChange, true);
+    addListener(document, "input", handleRecordedInput, true);
+    addListener(document, "focusout", handleRecordedFocusOut, true);
+    addListener(document, "submit", handleRecordedSubmit, true);
+    addListener(document, "keydown", handleRecordedKeydown, true);
+    addListener(window, "scroll", handleRecordedScroll, { capture: true, passive: true });
+  }
+
+  function stopRecording() {
+    if (!recordingState.active) return;
+    flushPendingInputs();
+    for (const { target, type, handler, options } of recordingState.listeners) {
+      target.removeEventListener(type, handler, options);
+    }
+    recordingState.listeners = [];
+    recordingState.pendingInputs.clear();
+    recordingState.active = false;
+  }
+
+  function handleRecordedClick(event) {
+    if (!recordingState.active) return;
+    flushPendingInputs();
+    const target = describeRecordingTarget(event.target);
+    if (!target) return;
+    emitRecordingEvent({ type: "click", target });
+  }
+
+  function handleRecordedChange(event) {
+    if (!recordingState.active) return;
+    const element = event.target;
+    if (!(element instanceof Element)) return;
+    if (isTextLikeInput(element)) {
+      return;
+    }
+    const target = describeRecordingTarget(element);
+    if (!target) return;
+    emitRecordingEvent({
+      type: "change",
+      target,
+      value: getElementValue(element).slice(0, 240),
+      checked: "checked" in element ? Boolean(element.checked) : undefined
+    });
+  }
+
+  function handleRecordedInput(event) {
+    if (!recordingState.active) return;
+    const element = event.target;
+    if (!isTextLikeInput(element)) return;
+    if (element instanceof HTMLInputElement && element.type === "password") return;
+    if (!recordingState.pendingInputs.has(element)) {
+      recordingState.pendingInputs.set(element, { lastEmittedValue: undefined });
+    }
+  }
+
+  function handleRecordedFocusOut(event) {
+    if (!recordingState.active) return;
+    flushInputFor(event.target);
+  }
+
+  function flushInputFor(element) {
+    if (!(element instanceof Element)) return;
+    const entry = recordingState.pendingInputs.get(element);
+    if (!entry) return;
+    const currentValue = getElementValue(element);
+    if (currentValue === entry.lastEmittedValue) return;
+    entry.lastEmittedValue = currentValue;
+    const target = describeRecordingTarget(element);
+    if (!target) return;
+    emitRecordingEvent({
+      type: "input",
+      target,
+      value: currentValue.slice(0, 240)
+    });
+  }
+
+  function flushPendingInputs() {
+    const elements = Array.from(recordingState.pendingInputs.keys());
+    for (const element of elements) flushInputFor(element);
+  }
+
+  function handleRecordedSubmit(event) {
+    if (!recordingState.active) return;
+    flushPendingInputs();
+    const target = describeRecordingTarget(event.target);
+    if (!target) return;
+    emitRecordingEvent({ type: "submit", target });
+  }
+
+  function handleRecordedKeydown(event) {
+    if (!recordingState.active) return;
+    if (!RECORDING_SEMANTIC_KEYS.has(event.key)) return;
+    flushPendingInputs();
+    const target = describeRecordingTarget(event.target);
+    emitRecordingEvent({
+      type: "keydown",
+      key: event.key,
+      modifiers: {
+        ctrl: event.ctrlKey,
+        meta: event.metaKey,
+        shift: event.shiftKey,
+        alt: event.altKey
+      },
+      target
+    });
+  }
+
+  function isTextLikeInput(element) {
+    if (element instanceof HTMLTextAreaElement) return true;
+    if (!(element instanceof HTMLInputElement)) return false;
+    const type = (element.getAttribute("type") || "text").toLowerCase();
+    return ["text", "search", "email", "url", "tel", "password", "number"].includes(type);
+  }
+
+  function handleRecordedScroll() {
+    if (!recordingState.active) return;
+    const now = Date.now();
+    if (now - recordingState.lastScrollAt < RECORDING_SCROLL_THROTTLE_MS) return;
+    recordingState.lastScrollAt = now;
+    emitRecordingEvent({
+      type: "scroll",
+      scroll: {
+        x: Math.round(window.scrollX),
+        y: Math.round(window.scrollY)
+      }
+    });
+  }
+
+  function describeRecordingTarget(element) {
+    if (!(element instanceof Element)) return null;
+    const tag = element.tagName.toLowerCase();
+    const role = element.getAttribute("role") || implicitRole(element) || "";
+    const label = (getElementLabel(element) || "").slice(0, 200);
+    const value = getElementValue(element).slice(0, 200);
+    const placeholder = (element.getAttribute("placeholder") || "").slice(0, 120);
+    const name = (element.getAttribute("name") || "").slice(0, 120);
+    let selector = "";
+    try {
+      selector = buildSelector(element);
+    } catch (_error) {
+      selector = "";
+    }
+    return {
+      tag,
+      role,
+      label,
+      value,
+      placeholder,
+      name,
+      selector,
+      href: tag === "a" ? (element.href || "").slice(0, 240) : ""
+    };
+  }
+
+  function emitRecordingEvent(payload) {
+    const event = {
+      ...payload,
+      url: location.href,
+      title: document.title,
+      ts: new Date().toISOString(),
+      snapshotBrief: captureBriefSnapshot()
+    };
+    try {
+      chrome.runtime.sendMessage({ type: "RECORDING_EVENT", event }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (_error) {
+      // Ignore — the background may be unavailable mid-navigation.
+    }
+  }
+
+  function captureBriefSnapshot() {
+    try {
+      const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+      return {
+        url: location.href,
+        title: document.title,
+        textBrief: text.slice(0, RECORDING_SNAPSHOT_BRIEF_CHARS)
+      };
+    } catch (_error) {
+      return { url: location.href, title: document.title, textBrief: "" };
+    }
   }
 })();
